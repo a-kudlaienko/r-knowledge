@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repo-knowledge"
+version = "0.1.0"
+description = "Local semantic code search: multi-repo, SQLite-backed, gitignore-aware, secret-sanitizing."
+requires-python = ">=3.10"
+readme = "README.md"
+authors = [{name = "Andrii Kudlaienko"}]
+license = {text = "MIT"}
+
+# Core deps: vector store + embeddings + AST parsers + gitignore + config I/O.
+# sentence-transformers pulls torch (~300MB on ARM) — documented in README.
+dependencies = [
+    # APSW is a SQLite wrapper that always exposes loadable-extension support,
+    # unlike stdlib sqlite3 on Homebrew/python.org macOS builds (which disable
+    # it at compile time, breaking sqlite-vec). APSW ships binary wheels for
+    # macOS ARM/x86, Linux, and Windows. Recommended by sqlite-vec docs.
+    "apsw>=3.44",
+    "sqlite-vec>=0.1.6",
+    "sentence-transformers>=2.7",
+    # tree-sitter-languages 1.10.x was built against the tree-sitter 0.21 C ABI.
+    # tree-sitter 0.22 changed Language() from (ptr, name) to (ptr) and breaks
+    # this bundled-grammars package. Pin both until a 2.x bundle ships, or
+    # migrate to per-language packages (tree-sitter-python etc.) in M4+.
+    "tree-sitter>=0.21,<0.22",
+    "tree-sitter-languages>=1.10,<2",
+    "numpy>=1.26",
+    "pathspec>=0.12",
+    "pyyaml>=6.0",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov"]
+
+[project.scripts]
+knowledge = "knowledge.cli:main"
+
+[tool.setuptools]
+packages = ["knowledge", "knowledge.chunkers"]
