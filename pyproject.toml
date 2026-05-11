@@ -30,7 +30,6 @@ dependencies = [
     "numpy>=1.26",
     "pathspec>=0.12",
     "pyyaml>=6.0",
-    "jinja2>=3.1",
 ]
 
 [project.optional-dependencies]

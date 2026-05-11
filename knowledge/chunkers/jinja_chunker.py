@@ -26,7 +26,7 @@ from pathlib import Path
 from .base import BaseChunker, Chunk
 
 
-_OPEN_RE = re.compile(r"\{%\s*(block|macro|call|filter)\s+(\w+)")
+_OPEN_RE = re.compile(r"\{%-?\s*(block|macro|call|filter)\s+(\w+)")
 
 
 class JinjaChunker(BaseChunker):
@@ -42,7 +42,7 @@ class JinjaChunker(BaseChunker):
             name = m.group(2)
             start = m.start()
 
-            end_re = re.compile(rf"\{{%\s*end{kind_word}\s*%\}}")
+            end_re = re.compile(rf"\{{%-?\s*end{kind_word}\s*-?%\}}")
             end_match = end_re.search(text, m.end())
             if end_match is None:
                 continue  # unclosed — skip this one

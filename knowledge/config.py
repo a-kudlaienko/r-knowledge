@@ -9,7 +9,7 @@ from __future__ import annotations
 # Schema + chunker versioning. Bump CHUNKER_VERSION when chunking rules change
 # in a way that invalidates existing chunks (forces rebuild via meta mismatch).
 SCHEMA_VERSION = "2"
-CHUNKER_VERSION = "1"
+CHUNKER_VERSION = "2"
 
 # Embedding model. BAAI/bge-small-en-v1.5: 384-dim, ~130MB, strong MTEB
 # score for mixed code+text retrieval, 512-token window.

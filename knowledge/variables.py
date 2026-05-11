@@ -45,7 +45,7 @@ VALID_SCOPES: frozenset[str] = frozenset({"ansible", "terraform", "helm", "all"}
 # access like ``{{ foo.bar }}`` or ``{{ foo[0] }}`` doesn't match —
 # those are almost never used for static path construction.
 _JINJA_VAR_RE = re.compile(
-    r"\{\{\s*([a-zA-Z_]\w*)(?:\s*\|[^}]+)?\s*\}\}"
+    r"\{\{-?\s*([a-zA-Z_]\w*)(?:\s*\|[^}]+?)?\s*-?\}\}"
 )
 
 # ``${var.name}`` — Terraform's interpolation for ``variable`` blocks.

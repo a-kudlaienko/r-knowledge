@@ -36,9 +36,10 @@ from .base import BaseResolver, Edge
 
 # {{ include "name.template" . }} and {{ template "name.template" . }}.
 # Both Helm forms — they differ operationally (``template`` is less
-# composable) but resolve to the same defined template name.
+# composable) but resolve to the same defined template name. Quotes
+# can be double or single (Go template string literals allow either).
 _INCLUDE_RE = re.compile(
-    r'{{-?\s*(?:include|template)\s+"([^"]+)"'
+    r'''{{-?\s*(?:include|template)\s+(?:"([^"]+)"|'([^']+)')'''
 )
 
 # {{- define "name" -}} — template definition sites. We emit these as a
@@ -47,7 +48,7 @@ _INCLUDE_RE = re.compile(
 # metadata, not a real dep). Keeping them in the edge stream avoids a
 # second I/O pass over template files.
 _DEFINE_RE = re.compile(
-    r'{{-?\s*define\s+"([^"]+)"'
+    r'''{{-?\s*define\s+(?:"([^"]+)"|'([^']+)')'''
 )
 
 
@@ -90,30 +91,39 @@ class HelmResolver(BaseResolver):
                 continue
             repo = dep.get("repository")
             alias = dep.get("alias")
-            # Use the repo+name as the raw so external refs carry enough
-            # info to identify them. For local file:// refs we strip the
-            # prefix so relations.py can resolve the directory.
+            # Three cases, each encoded distinctly so the resolver can
+            # pick the correct lookup strategy:
+            #
+            # 1. ``file://<path>`` — local chart at that path (relative
+            #    to the Chart.yaml's dir). ``raw`` carries the path.
+            # 2. Omitted/empty repository — Helm convention: the chart
+            #    is unpacked at ``<parent>/charts/<name>``. Encode by
+            #    leaving ``raw`` empty; resolver uses ``symbol`` (name).
+            # 3. ``http(s)://``, ``oci://``, ``@alias`` — external.
+            #    Keep ``raw`` = repo for display; resolver returns None.
             if isinstance(repo, str) and repo.startswith("file://"):
-                raw = repo[len("file://"):]
-                # Normalize trailing slash and resolve against Chart.yaml
-                # later. Subchart name is appended as a conventional
-                # "charts/<name>" if the path refers to a parent.
                 edges.append(
                     Edge(
                         kind="helm_dependency",
-                        raw=raw.rstrip("/"),
+                        raw=repo[len("file://"):].rstrip("/"),
+                        symbol=name,
+                        line=0,
+                    )
+                )
+            elif not isinstance(repo, str) or not repo:
+                edges.append(
+                    Edge(
+                        kind="helm_dependency",
+                        raw="",
                         symbol=name,
                         line=0,
                     )
                 )
             else:
-                # External — remote repo, OCI, or name-only. Keep name;
-                # set raw to repo string if present.
-                raw = repo if isinstance(repo, str) and repo else name
                 edges.append(
                     Edge(
                         kind="helm_dependency",
-                        raw=raw,
+                        raw=repo,
                         symbol=alias if isinstance(alias, str) else name,
                         line=0,
                     )
@@ -128,13 +138,13 @@ class HelmResolver(BaseResolver):
         # Collect define sites first — relations.py uses them to build
         # the per-chart name→file map, then drops them before persisting.
         for m in _DEFINE_RE.finditer(text):
-            name = m.group(1)
+            name = m.group(1) or m.group(2)
             line = text.count("\n", 0, m.start()) + 1
             edges.append(
                 Edge(kind="helm_define", raw=name, symbol=None, line=line)
             )
         for m in _INCLUDE_RE.finditer(text):
-            name = m.group(1)
+            name = m.group(1) or m.group(2)
             line = text.count("\n", 0, m.start()) + 1
             edges.append(
                 Edge(kind="helm_include", raw=name, symbol=None, line=line)

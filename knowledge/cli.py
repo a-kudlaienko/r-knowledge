@@ -403,6 +403,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Include kind='unresolved' edges (non-literal dynamic imports).",
     )
     p_graph.add_argument(
+        "--no-orphans",
+        action="store_true",
+        help="Drop indexed files that have no edges in or out "
+             "(CI/CD files stay visible). Default shows every file as a "
+             "dot so the graph reads as a full repo map.",
+    )
+    p_graph.add_argument(
         "--open",
         action="store_true",
         help="Launch the default web browser on the rendered file.",
@@ -2157,6 +2164,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
             include_external=args.include_external,
             include_parametric=args.include_parametric,
             include_unresolved=args.include_unresolved,
+            include_orphans=not args.no_orphans,
         )
 
     out_path = (

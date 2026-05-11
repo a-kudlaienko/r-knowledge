@@ -30,10 +30,8 @@ use, but it's ~300KB and not worth the default cost.
 from __future__ import annotations
 
 import colorsys
-import hashlib
 import html
 import json
-from pathlib import Path
 from typing import NamedTuple
 
 from .db import Connection
@@ -72,6 +70,7 @@ def build_graph_html(
     include_external: bool = False,
     include_parametric: bool = False,
     include_unresolved: bool = False,
+    include_orphans: bool = True,
 ) -> str:
     """Return a self-contained HTML document visualizing the project's
     dependency graph. Caller writes it to disk.
@@ -87,6 +86,13 @@ def build_graph_html(
 
     ``include_unresolved`` — edges with stored ``kind='unresolved'``
     (non-literal dynamic imports). Rare; included as opt-in.
+
+    ``include_orphans`` — when True (default), every indexed project
+    file becomes a node even if it has no edges in or out. The graph
+    becomes a full repo map: isolated dots show "this file exists" and
+    clusters show structural relations. When False, only files that
+    participate in an edge are rendered (plus CI/CD files, which stay
+    visible under both modes).
     """
     nodes, edges = _collect(
         conn,
@@ -94,6 +100,7 @@ def build_graph_html(
         include_external=include_external,
         include_parametric=include_parametric,
         include_unresolved=include_unresolved,
+        include_orphans=include_orphans,
     )
     groups = _group_color_map(nodes)
     return _render_html(project_name, nodes, edges, groups)
@@ -111,13 +118,15 @@ def _collect(
     include_external: bool,
     include_parametric: bool,
     include_unresolved: bool,
+    include_orphans: bool,
 ) -> tuple[list[GraphNode], list[GraphEdge]]:
     """Pull edges + the file rows they connect into typed tuples.
 
-    Only files that appear as SOURCE or TARGET in the included edge
-    set become nodes — orphan files (no edges in or out) are dropped
-    to keep the graph readable. The CLI's `--include-*` flags widen
-    which edges are considered.
+    With ``include_orphans=True`` (default), every indexed project file
+    becomes a node — the graph reads as a full repo map. With False,
+    only files that appear as source/target of an included edge are
+    kept (plus CI/CD files via ``_ensure_cicd_nodes``), which is the
+    old compact "structure only" view.
     """
     # One query to pull every edge we might include; we filter in
     # Python because the predicates mix NULL-checks, kind exclusions,
@@ -188,8 +197,13 @@ def _collect(
                 title=_edge_title(kind, raw),
             ))
         else:
-            # External (resolver tried + missed — stdlib / third-party).
-            if not include_external:
+            # External (resolver tried + missed — stdlib / third-party /
+            # marketplace GHA action). CI/CD pipeline files are always
+            # shown: a workflow whose only ``uses:`` are marketplace
+            # actions is still a meaningful repo artifact that the user
+            # expects on the graph. For other languages the default
+            # still drops externals to keep the graph readable.
+            if not include_external and not _is_cicd_file(src_rel):
                 continue
             _remember_file(nodes_by_id, src_id, src_rel, src_lang)
             synth_id, next_synth_id = _synthetic_node(
@@ -202,6 +216,18 @@ def _collect(
                 source=src_id, target=synth_id, kind=kind,
                 title=_edge_title(kind, raw),
             ))
+
+    # Add isolated-file nodes.
+    # - include_orphans=True: every indexed project file becomes a
+    #   dot. Connected files cluster; isolated files sit as dots in
+    #   their group's color. This is the "repo map" view.
+    # - include_orphans=False: only CI/CD files are pulled in (via
+    #   _ensure_cicd_nodes), preserving the "always show CI/CD"
+    #   guarantee under the compact structure-only view.
+    if include_orphans:
+        _ensure_all_project_nodes(conn, project_id, nodes_by_id)
+    else:
+        _ensure_cicd_nodes(conn, project_id, nodes_by_id)
 
     return list(nodes_by_id.values()), edges
 
@@ -261,6 +287,85 @@ def _top_level_dir(rel_path: str) -> str:
     return rel_path.split("/", 1)[0]
 
 
+# CI/CD pipeline files are always shown on the graph — even when every
+# ``uses:`` is a marketplace action (external, target_file_id=NULL).
+# These files are structurally meaningful to the user ("what automation
+# does this repo run?") and dropping them as orphans is surprising.
+# Covers the resolvers we ship today; add new path shapes here as we
+# add CI/CD resolvers (GitLab CI, CircleCI, Jenkins, …).
+def _is_cicd_file(rel_path: str | None) -> bool:
+    if not rel_path:
+        return False
+    parts = rel_path.split("/")
+    # GitHub Actions workflow: .github/workflows/*.yml|*.yaml
+    if (
+        len(parts) >= 3
+        and parts[0] == ".github"
+        and parts[1] == "workflows"
+        and parts[-1].endswith((".yml", ".yaml"))
+    ):
+        return True
+    # GitHub Actions composite action manifest: .github/actions/<name>/action.yml
+    if (
+        len(parts) >= 4
+        and parts[0] == ".github"
+        and parts[1] == "actions"
+        and parts[-1] in ("action.yml", "action.yaml")
+    ):
+        return True
+    return False
+
+
+def _ensure_all_project_nodes(
+    conn: Connection, project_id: int, nodes_by_id: dict[int, "GraphNode"]
+) -> None:
+    """Promote every indexed project file to a node.
+
+    Idempotent: files already added by the edge loop are skipped via
+    ``_remember_file``'s dedup. This is the "repo map" pass — isolated
+    dots mean the file is indexed but has no resolved relations.
+    """
+    rows = conn.execute(
+        "SELECT id, rel_path, lang FROM files WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    for file_id, rel_path, lang in rows:
+        _remember_file(nodes_by_id, file_id, rel_path, lang)
+
+
+def _ensure_cicd_nodes(
+    conn: Connection, project_id: int, nodes_by_id: dict[int, "GraphNode"]
+) -> None:
+    """Pull CI/CD files into the node set even when they have no edges at all.
+
+    A workflow with no ``uses:`` statements is legal (scripted-only job).
+    Without this pass, it would vanish from the graph with no signal
+    that it was indexed.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, rel_path, lang FROM files
+        WHERE project_id = ?
+          AND rel_path LIKE '.github/workflows/%'
+        UNION ALL
+        SELECT id, rel_path, lang FROM files
+        WHERE project_id = ?
+          AND rel_path LIKE '.github/actions/%/action.yml'
+        UNION ALL
+        SELECT id, rel_path, lang FROM files
+        WHERE project_id = ?
+          AND rel_path LIKE '.github/actions/%/action.yaml'
+        """,
+        (project_id, project_id, project_id),
+    ).fetchall()
+    for file_id, rel_path, lang in rows:
+        if not _is_cicd_file(rel_path):
+            # LIKE is coarse (matches ``.github/workflows/README.md``);
+            # double-check with the predicate.
+            continue
+        _remember_file(nodes_by_id, file_id, rel_path, lang)
+
+
 # ---------------------------------------------------------------------------
 # Hover tooltip builders
 # ---------------------------------------------------------------------------
@@ -305,33 +410,48 @@ def _short(raw: str, limit: int = 40) -> str:
 
 
 def _group_color_map(nodes: list[GraphNode]) -> dict[str, str]:
-    """Stable color per group.
+    """Visually distinct color per group.
 
-    Special-case the synthetic buckets (``_external`` / ``_parametric`` /
-    ``_unresolved``) with neutral grays so they don't compete with real
-    project groups for attention. Everything else hashes the group name
-    into a hue on a fixed saturation/lightness — deterministic, distinct,
-    and doesn't need a hand-curated palette.
+    Special buckets (``_external`` / ``_parametric`` / ``_unresolved``)
+    stay at curated neutrals so they don't compete with real groups.
+
+    For real groups we sort names alphabetically and walk the hue wheel
+    by the golden-ratio conjugate — each new hue lands as far as
+    possible from every previous one (classic low-discrepancy trick),
+    so even with 3-4 groups no two collide. Hash-by-name had no spacing
+    guarantee and produced near-duplicate blues in practice (e.g.
+    ``argocd`` 240° vs ``terraform`` 239°).
     """
     special = {
         "_external":    "#cccccc",
         "_parametric":  "#e5c07b",
         "_unresolved":  "#e06c75",
     }
+    # Collect real groups first; deterministic order = alphabetical.
+    real_groups = sorted({
+        n.group for n in nodes
+        if n.group not in special and not n.group.startswith("_")
+    })
+
     out: dict[str, str] = {}
+    # Golden-ratio conjugate: every new i lands in the largest remaining
+    # gap on the hue wheel. Starting hue 0.08 (≈29°, warm coral) picks
+    # a pleasant first color instead of pure red.
+    golden = 0.6180339887498949
+    start = 0.08
+    for i, g in enumerate(real_groups):
+        h = (start + i * golden) % 1.0
+        r, g_, b = colorsys.hls_to_rgb(h, 0.55, 0.65)
+        out[g] = f"#{int(r*255):02x}{int(g_*255):02x}{int(b*255):02x}"
+
+    # Specials fill in last so real groups dominate the legend ordering
+    # logic upstream (which sorts the full dict for display).
     for n in nodes:
         g = n.group
         if g in out:
             continue
         if g in special:
             out[g] = special[g]
-            continue
-        # HSL: hash the group name to a hue in [0, 1). 65% saturation
-        # and 55% lightness keeps text readable on the node and keeps
-        # colors distinct without being neon.
-        h = int(hashlib.md5(g.encode("utf-8")).hexdigest(), 16) % 360 / 360.0
-        r, g_, b = colorsys.hls_to_rgb(h, 0.55, 0.65)
-        out[g] = f"#{int(r*255):02x}{int(g_*255):02x}{int(b*255):02x}"
     return out
 
 
