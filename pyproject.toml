@@ -9,7 +9,7 @@ description = "Local semantic code search: multi-repo, SQLite-backed, gitignore-
 requires-python = ">=3.10"
 readme = "README.md"
 authors = [{name = "Andrii Kudlaienko"}]
-license = {text = "MIT"}
+license = {text = "AGPL-3.0-or-later"}
 
 # Core deps: vector store + embeddings + AST parsers + gitignore + config I/O.
 # sentence-transformers pulls torch (~300MB on ARM) — documented in README.

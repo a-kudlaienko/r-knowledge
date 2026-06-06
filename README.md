@@ -1,62 +1,291 @@
 # repo-knowledge
 
-Local semantic code search. Default storage is a single SQLite DB at `~/.knowledge/index.sqlite` holding chunks + embeddings for many repos. Optional **shared PostgreSQL mode** routes a project (or all of them) to a team-shared pgvector database — opt in per repo with a `.knowledge.yaml`. Respects `.gitignore`, scrubs a short list of secret patterns, no external services beyond the DB you point it at.
+Local semantic search and session memory for git repos — ask how code works, map dependencies, and pick up where you left off. SQLite by default; optional team-shared PostgreSQL.
 
-Answers *meaning* questions: "how does vault auth work", "where is the ingress load balancer defined", "find the function that handles cert regeneration".
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-≥3.10-blue.svg)](https://www.python.org/)
+[![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](pyproject.toml)
+[![CI](https://github.com/AKudlaienko/repo-knowledge/actions/workflows/ci.yml/badge.svg)](https://github.com/AKudlaienko/repo-knowledge/actions/workflows/ci.yml)
 
-## Install
+Answers *meaning* questions: "how does vault auth work", "where is the ingress load balancer defined", "what did we decide about cache invalidation last week".
+
+---
+
+## How To
+
+**1. [Install](#install--first-run)** — clone [this repo](https://github.com/AKudlaienko/repo-knowledge), run `pip install -e .`, then [`knowledge build`](#index-maintenance) inside any git project. First run downloads the embedding model (~130 MB) and may take 1–5 minutes.
+
+**2. [Ask questions](#search--cartography)** — from your repo root, run `knowledge ask "how does X work"`. Use [`find`](#search--cartography) / [`grep`](#search--cartography) for exact symbols; [`why`](#search--cartography) / [`map`](#search--cartography) / [`brief`](#search--cartography) to orient before reading files.
+
+**3. [Keep the index fresh](#index-maintenance)** — `knowledge update` after changes; `knowledge status --json` for scripts and agents (`missing` → build, `stale` → update, `fresh` → query).
+
+**4. [Explore dependencies](#dependency-graph)** — `knowledge relations <file>` before diving into code; [`knowledge graph`](#dependency-graph) for an HTML view; [`knowledge vars set`](#dependency-graph) for Ansible/Terraform template paths.
+
+**5. [Remember work across sessions](#session-memory)** — `knowledge resume` at session start; `knowledge decide` for non-obvious choices; [`knowledge history stage`](#session-memory) + [`install-hooks`](#claude-code-integration) to auto-persist summaries.
+
+**6. [Use with Claude Code](#claude-code-integration)** — `knowledge install-skill` wires the `/knowledge` skill (auto-build, auto-update, agent-first verbs).
+
+**7. [Share with your team (optional)](#shared-postgresql-mode)** — switch a project to shared PostgreSQL via [`.knowledge.yaml`](#configuration-reference); `make pg-run` for local Docker dev.
+
+### Query hints (short)
+
+Prefix natural-language queries with a *kind hint* when you know what you're looking for — it improves retrieval. Examples: `python function:`, `terraform resource:`, `ansible task:`, `helm template:`, `docs:`.
+
+| Looking for | Prefix | Good `--kind` |
+|---|---|---|
+| Python function | `python function:` | `function` |
+| Terraform resource | `terraform resource:` | `resource` |
+| Ansible task | `ansible task:` | `ansible_task` |
+| Helm template | `helm template:` | `helm_template` |
+| README / doc section | `docs:` | `markdown_section` |
+
+[Full query-enrichment table ↓](#query-enrichment-full)
+
+---
+
+## Details
+
+Jump to: [Install](#install--first-run) · [Index](#index-maintenance) · [Search](#search--cartography) · [Graph](#dependency-graph) · [Memory](#session-memory) · [Claude Code](#claude-code-integration) · [Indexed](#whats-indexed--sanitization) · [Multi-repo](#multi-repo-admin) · [PostgreSQL](#shared-postgresql-mode) · [Config](#configuration-reference) · [Development](#development--internals)
+
+<details>
+<summary><strong>Install & first run</strong></summary>
+
+### Install & first run
 
 ```bash
-git clone <repo-url> ~/git/repo-knowledge
+git clone https://github.com/AKudlaienko/repo-knowledge.git ~/git/repo-knowledge
 cd ~/git/repo-knowledge
 pip install -e .
 ```
 
-This registers the `knowledge` command globally (or in your active venv). First run downloads `BAAI/bge-small-en-v1.5` (~130MB) to `~/.knowledge/models/`. Torch wheel on macOS ARM is ~300MB — expected.
+This registers the `knowledge` command globally (or in your active venv). First run downloads `BAAI/bge-small-en-v1.5` (~130 MB) to `~/.knowledge/models/`. The Torch wheel on macOS ARM is ~300 MB — expected.
 
-## Usage (per repo)
+For shared PostgreSQL support:
+
+```bash
+pip install -e '.[postgres]'
+```
+
+Then continue with [Shared PostgreSQL mode](#shared-postgresql-mode).
+
+</details>
+
+<details>
+<summary><strong>Index maintenance</strong></summary>
+
+### Index maintenance
 
 ```bash
 cd ~/git/my-repo
-knowledge build          # first time: scan + chunk + embed (cold: 1-5 min)
+knowledge build          # first time: scan + chunk + embed (cold: 1–5 min)
 knowledge update         # incremental; auto-detects changed files
-knowledge search "how does the vault callback inject secrets"
+knowledge status         # human-readable: missing | stale | fresh
+knowledge status --json  # machine-readable — branch on state before queries
+```
+
+Add more repos the same way — each `knowledge build` registers a new project row in the DB. Version drift (chunker or embedding model bump) triggers a forced rebuild on the next `update`.
+
+Extra exclusions without touching `.gitignore`: add a `.knowledgeignore` file at the repo root (gitignore-style patterns).
+
+</details>
+
+<details>
+<summary><strong>Search & cartography</strong></summary>
+
+### Search & cartography
+
+**Default for meaning questions:** `knowledge ask` — hybrid FTS + vector search, RRF merge, reranked by recency/session/hub centrality, cached per `(query, HEAD sha)`.
+
+```bash
+knowledge ask "how does the vault callback inject secrets"
+knowledge ask "octavia LB floating IP" --top-k 5 --kind resource --lang hcl
+knowledge ask "cert regen" --budget 2000 --no-cache
+```
+
+**Vector-only (scripting / distance scores):** `knowledge search` — same filters as `ask`, no RRF/rerank/cache.
+
+```bash
 knowledge search "terraform resource: load balancer" --kind resource --lang hcl
+knowledge search "vault auto_load convention" --all-projects
 ```
 
-Add more repos the same way — each `knowledge build` registers a new project row in the shared DB. Searches default to the current repo (detected via `git rev-parse --show-toplevel`); `--all-projects` widens.
+**Fast lookup (no embedder):**
 
-## Skill integration
+```bash
+knowledge find VaultClient --exact
+knowledge find regen --kind ansible_task
+knowledge grep 'vault AND approle'
+knowledge grep '"exact phrase"'
+```
 
-Wire the `/knowledge` skill into a project (or into your whole user profile) with a single command:
+**Orient before reading:**
+
+```bash
+knowledge why ansible/roles/karmada/tasks/main.yml
+knowledge map --dir terraform --depth 3
+knowledge brief
+```
+
+**Follow a hit:**
+
+```bash
+knowledge get <chunk_id>
+knowledge get <chunk_id> --with-siblings --raw
+knowledge path <chunk_id>
+```
+
+By default, queries scope to the current repo (`git rev-parse --show-toplevel`). Use `--all-projects` to search across every registered repo.
+
+</details>
+
+<details id="query-enrichment-full">
+<summary><strong>Query enrichment (full table)</strong></summary>
+
+### Query enrichment (full table)
+
+The embedding model retrieves best when the query hints at *what kind of thing* is being sought. Prefix user queries based on intent; add `--kind` when irrelevant kinds crowd results.
+
+| User is looking for | Prefix the query with | Good `--kind` filter |
+|---|---|---|
+| Python function body | `python function:` | `function` or `big_parent` |
+| Python class | `python class:` | `class` |
+| Python method | `python method:` | `method` |
+| JS / TS function | `javascript function:` | `function` |
+| Terraform resource | `terraform resource:` | `resource` |
+| Terraform variable / output | `terraform variable:` / `terraform output:` | `variable` / `output` |
+| Terraform module | `terraform module:` | `module` |
+| Terraform locals | `terraform locals:` | `locals_block` or `locals_entry` |
+| Ansible task | `ansible task:` | `ansible_task` |
+| Ansible handler | `ansible handler:` | `ansible_handler` |
+| Helm template | `helm template:` | `helm_template` |
+| Helm values key | `helm values:` | `helm_values_section` |
+| K8s manifest | `kubernetes Deployment:` (etc.) | `yaml_doc` + `--lang yaml` |
+| Shell function | `shell function:` | `shell_function` |
+| Jinja macro or block | `jinja:` | `jinja_macro` / `jinja_block` |
+| Dockerfile stage | `dockerfile stage:` | `dockerfile_stage` |
+| Markdown doc / README | `docs:` | `markdown_section` |
+| Config value / literal | `value:` | (no filter) |
+| Docstring / doc comment | `docstring:` | (no filter) |
+
+</details>
+
+<details>
+<summary><strong>Dependency graph</strong></summary>
+
+### Dependency graph
+
+Before opening code, ask which files matter:
+
+```bash
+knowledge relations knowledge/cli.py
+knowledge relations knowledge/cli.py --direction forward --depth 2
+knowledge relations knowledge/db.py --direction reverse
+knowledge relations stats
+```
+
+**Coverage:** Python, JavaScript/TypeScript, Terraform/HCL, Helm (`Chart.yaml` + `{{ include }}`), Ansible (tasks/roles/modules via `ansible.cfg`), GitHub Actions (local workflows/actions), Kustomize, **ArgoCD** (`Application` / `ApplicationSet` → chart paths in App-of-Apps layouts).
+
+Output is compact JSON for LLM consumption. Add `--pretty` for human-readable output.
+
+**Dynamic paths** like `include_tasks: "_tasks/{{ deploy_env }}/..."` or Terraform `source = "./${var.env}"`:
+
+```bash
+knowledge vars set ansible deploy_env=prod region=us-east
+knowledge vars set terraform env=prod
+knowledge vars import ansible /path/to/vars.json
+knowledge vars list [--scope ansible] [--json]
+knowledge vars unset ansible deploy_env
+```
+
+Scoped by domain (`ansible` / `terraform` / `helm` / `all`); mutations auto-apply against existing edges. Edges waiting for variables show as `kind="parametric"` (distinct from `external` or `unresolved`).
+
+**Visualize as HTML:**
+
+```bash
+knowledge graph [--output file.html] [--open]
+knowledge graph --include-external --include-parametric --include-unresolved
+```
+
+Self-contained HTML (vis-network via CDN); nodes colored by top-level directory.
+
+</details>
+
+<details>
+<summary><strong>Session memory</strong></summary>
+
+### Session memory
+
+Two complementary stores:
+
+- **History** (`knowledge history …`) — free-form work summaries. Good for "what did we do last Tuesday."
+- **Decisions** (`knowledge decide` / `decisions` / `resume`) — structured choices with topic, decision, rationale, files. Good for "why did we pick X over Y."
+
+**Session start:**
+
+```bash
+knowledge resume
+```
+
+Returns last decisions, recently touched files, un-ingested stage entries, and hub files (~1200 tokens).
+
+**Record a choice as you make it:**
+
+```bash
+knowledge decide "cache invalidation" \
+  --decision "wipe per-project on any chunk change" \
+  --rationale "agent-driven updates shouldn't thrash cache" \
+  --files knowledge/query_cache.py knowledge/indexer.py
+```
+
+**History — stage during work, ingest to persist:**
+
+```bash
+knowledge history stage \
+  --short "Fixed ambiguous project-name resolution." \
+  --long "Added AmbiguousProjectName in projects.py …" \
+  --tags "fix,cli"
+
+knowledge history ingest
+knowledge history recent --limit 10
+knowledge history search "auth middleware"
+knowledge history get <id>
+```
+
+Use history for narrative continuity; use decisions for commitments. Don't search history for code questions — use `ask` instead.
+
+</details>
+
+<details>
+<summary><strong>Claude Code integration</strong></summary>
+
+### Claude Code integration
+
+**Skill** — wire `/knowledge` into a project or user profile:
 
 ```bash
 cd ~/your-project
-knowledge install-skill              # project-scoped → .claude/skills/knowledge/SKILL.md
-knowledge install-skill --user       # user-scoped   → ~/.claude/skills/knowledge/SKILL.md
-knowledge install-skill --symlink    # symlink to the source (auto-updates on `git pull` in repo-knowledge)
-knowledge install-skill --force      # overwrite an existing install
+knowledge install-skill              # project → .claude/skills/knowledge/SKILL.md
+knowledge install-skill --user       # user    → ~/.claude/skills/knowledge/SKILL.md
+knowledge install-skill --symlink    # symlink (auto-updates on git pull here)
+knowledge install-skill --force      # overwrite existing install
 ```
 
-The skill auto-builds the index on first use, auto-updates when files have changed, and stores/retrieves per-project work summaries so a new session can pick up where the last one left off (see `knowledge history --help`).
+The skill auto-builds on first use, auto-updates when files change, and prefers `ask` / `find` / `grep` / `why` / `map` / `brief` / `resume` / `decide`.
 
-### Auto-flush staged summaries (optional)
-
-To have Claude Code automatically run `knowledge history ingest` at compaction and session end — so staged work summaries always make it into SQLite before the context is summarized away — register the hooks:
+**Hooks (optional)** — auto-flush staged summaries at compaction and session end:
 
 ```bash
-cd ~/your-project
-knowledge install-hooks              # → <cwd>/.claude/settings.json  (project-scoped)
-knowledge install-hooks --user       # → ~/.claude/settings.json      (every session, any project)
+knowledge install-hooks              # → <cwd>/.claude/settings.json
+knowledge install-hooks --user       # → ~/.claude/settings.json
 ```
 
-The command idempotently merges into an existing `settings.json`; other hooks and config keys are preserved. It registers three events:
+Idempotently merges into existing `settings.json`. Registers three events, all running `knowledge history ingest`:
 
-- `Stop` — fires after every assistant turn. Incrementally drains the stage so SQLite stays nearly live with the session. If the terminal gets killed abruptly, the previous turn's entries are already persisted.
-- `PreCompact` — fires before manual `/compact` or auto-compaction. Catches anything written after the last `Stop`.
-- `SessionEnd` — fires when the session closes gracefully. Final sweep.
+- `Stop` — after every assistant turn (incremental drain)
+- `PreCompact` — before manual `/compact` or auto-compaction
+- `SessionEnd` — graceful session close
 
-All three run `knowledge history ingest`. An empty stage is a no-op — user-scoped hooks are safe to install globally; they won't create project rows for repos that don't use `knowledge`.
+An empty stage is a no-op — user-scoped hooks are safe globally.
 
 #### PATH caveat — hooks run in a subshell that may not see your venv
 
@@ -65,111 +294,162 @@ Claude Code runs hook commands in a subprocess. That subprocess inherits `PATH` 
 - **Terminal launch**: inherits your shell's `PATH`, so a `knowledge` on `PATH` works.
 - **GUI/dock launch** (macOS), **launchd service**, **IDE plugin**: often gets a minimal system `PATH` that does NOT include per-user venv directories (e.g. `~/venvs/*/bin`).
 
-If `knowledge` lives in a venv (`which knowledge` points at something like `/Users/you/venvs/claude/bin/knowledge`), the hook silently fails on GUI launches — your stage file stays unflushed.
+If `knowledge` lives in a venv, the hook silently fails on GUI launches — your stage file stays unflushed.
 
 **Two fixes, pick one:**
 
 1. **Install with `--absolute`** (recommended when the tool lives in a venv):
    ```bash
-   knowledge install-hooks --absolute              # project-scoped
-   knowledge install-hooks --user --absolute       # user-scoped
+   knowledge install-hooks --absolute
+   knowledge install-hooks --user --absolute
    ```
-   The hook command is written as an absolute path (e.g. `/Users/you/venvs/claude/bin/knowledge history ingest`), so `PATH` doesn't matter. Re-running `install-hooks` upgrades the existing entry in place — no duplicates.
-
-   Trade-off: the settings.json becomes machine-specific. For a `--user` install that's fine (it's already under `~/.claude/`). For a project-scoped install you want to commit, prefer option 2.
+   Writes an absolute path to the hook command. Re-running upgrades in place — no duplicates. Trade-off: machine-specific `settings.json`.
 
 2. **Put `knowledge` on a system `PATH` directory** (portable across teammates):
    ```bash
    sudo ln -s "$(which knowledge)" /usr/local/bin/knowledge
    ```
-   Then leave `install-hooks` in its default (bare) mode, so `.claude/settings.json` stays portable.
-
-You can switch modes any time — re-run `install-hooks` with or without `--absolute`; the in-place upgrade rewrites existing entries cleanly.
+   Then use default (bare) `install-hooks` so `.claude/settings.json` stays portable.
 
 **Verify the flow:**
-1. Run `knowledge history stage --short "..." --long "..."` during a Claude Code session. This appends to `~/.knowledge/stage/<project-slug>/sess-<session-id>.jsonl` — isolated per project and per session so concurrent Claude instances can't clobber each other's staged work.
-2. Run `/compact` (or let auto-compact fire).
-3. `knowledge history recent --limit 1` — the entry should be in the DB and the per-session stage file gone (ingest deletes it after a successful flush).
 
-## What's indexed
+1. `knowledge history stage --short "..." --long "..."` during a session.
+2. Run `/compact` (or let auto-compact fire).
+3. `knowledge history recent --limit 1` — entry in DB; stage file gone after ingest.
+
+</details>
+
+<details>
+<summary><strong>What's indexed & sanitization</strong></summary>
+
+### What's indexed & sanitization
 
 Everything matching `.gitignore` rules is skipped. Supported languages: Python, JavaScript/TypeScript, Terraform/HCL, YAML (Ansible + Helm + K8s manifests), JSON, Shell, Jinja2, Dockerfile, Markdown.
 
-The following domains also get a **file-to-file dependency graph** (`knowledge relations <file>`): Python, JavaScript/TypeScript, Terraform/HCL (module sources + templatefile/file), Helm (Chart.yaml deps + intra-chart `{{ include }}`), Ansible (include_tasks/import_tasks, include_role/import_role honoring `ansible.cfg` `roles_path`, custom modules in `library/`/`action_plugins/`), GitHub Actions (local reusable workflows + composite actions, external `uses:` passed through), and Kustomize (`resources`, `bases`, `components`, patches, generators). Before opening code to answer a question, you can ask the graph which files are worth reading first — compact JSON designed for LLM consumption.
+**Secret sanitization** — two layers applied before any chunk is embedded:
 
-**Dynamic paths** like `include_tasks: "_tasks/{{ deploy_env }}/..."` or Terraform `source = "./${var.env}"` can be resolved by setting **per-project variables**: `knowledge vars set ansible deploy_env=prod` (or `knowledge vars import ansible vars.json` for bulk). Scoped by domain (`ansible`/`terraform`/`helm`/`all`); auto-applies against existing edges. Edges waiting for variables show as `kind="parametric"` (distinct from `external` stdlib or `unresolved` non-literal expressions).
-
-**Visualize as HTML**: `knowledge graph [--output file.html] [--open]` writes a self-contained HTML (vis-network via CDN) with nodes colored by top-level directory and hover tooltips showing full paths. Resolved project-to-project edges by default; flags add `--include-external` / `--include-parametric` / `--include-unresolved`.
-
-## Secret sanitization
-
-Two layers applied before any chunk is embedded:
-
-1. **Regex scrub** — `ghp_*`, `github_pat_*`, `hvs.*`, `AKIA*`, JWTs, `-----BEGIN ... PRIVATE KEY-----`, long SSH keys → `CHANGE_ME`.
+1. **Regex scrub** — `ghp_*`, `github_pat_*`, `hvs.*`, `AKIA*`, JWTs, `-----BEGIN … PRIVATE KEY-----`, long SSH keys → `CHANGE_ME`.
 2. **Sensitive-key replacement** — in YAML/HCL/JSON, values under keys like `password`, `*_token`, `*_secret`, `api_key`, `vault_*_id` → `CHANGE_ME`.
 
-Plus `.gitignore` + `.knowledgeignore` are honored, so gitignored files (where secrets usually live) aren't scanned at all.
+Plus `.gitignore` + `.knowledgeignore` are honored, so gitignored files (where secrets usually live) aren't scanned at all. Any `CHANGE_ME` in search results is either a user placeholder or a sanitizer replacement — never a real leaked secret.
 
-## Layout
+</details>
 
-See `knowledge/README.md` for the module mapping table.
+<details>
+<summary><strong>Multi-repo admin</strong></summary>
 
-## Shared PostgreSQL mode
+### Multi-repo admin
+
+```bash
+knowledge projects
+knowledge stats
+knowledge forget <name>                # drop project + all chunks/edges/history
+knowledge forget <name> --sqlite-only  # after PG migration — local copy only
+```
+
+Default storage is a single DB (`~/.knowledge/index.sqlite` for SQLite mode) holding many projects. Each teammate rebuilds locally unless using [shared PostgreSQL](#shared-postgresql-mode).
+
+</details>
+
+<details>
+<summary><strong>Shared PostgreSQL mode</strong></summary>
+
+### Shared PostgreSQL mode
 
 Default storage is local SQLite — fine for solo work. Switch a project (or every project on the laptop) to a team-shared **pgvector** database when you want teammates to share the same index, history, and decisions.
 
 **Storage choice is per project.** The same machine can keep project A on shared PG and project B on local SQLite. Resolution at runtime:
 
 1. `KNOWLEDGE_DATABASE_URL` env (CI override) — full DSN, wins everything
-2. Walk cwd → cwd's parents looking for `.knowledge.yaml` — first match wins
+2. Walk cwd → parents looking for `.knowledge.yaml` — first match wins
 3. `$HOME/.knowledge.yaml` — laptop-wide default
 4. Built-in default: SQLite
 
-The same file name and schema at every scope ([template](knowledge/config.example.yaml)). The closer file wins.
+Same file name and schema at every scope ([template](knowledge/config.example.yaml)). The closer file wins.
 
-### Quick start (Docker dev container)
+#### Quick start (Docker dev container)
 
 ```bash
-pip install -e '.[postgres]'                       # install psycopg + pgvector
+pip install -e '.[postgres]'
 
-export KNOWLEDGE_PG_USER={your-user}
+export KNOWLEDGE_PG_USER=postgres
 export KNOWLEDGE_PG_PASSWORD=$(openssl rand -hex 16)
-make pg-run                                        # builds image, starts container, applies schema
+make pg-run
 
 cd /path/to/your-repo
-knowledge config init --project                    # writes ./.knowledge.yaml from template
-$EDITOR .knowledge.yaml                            # mode=shared_postgresql, host=127.0.0.1, sslmode=disable
+knowledge config init --project
+$EDITOR .knowledge.yaml    # mode=shared_postgresql, host=127.0.0.1, sslmode=disable
 
-knowledge config show                              # confirms which file is active + masked DSN
-knowledge db ping                                  # opens the DB, prints version + extension status
-
-knowledge db init-postgres                         # idempotent re-apply of the schema
-knowledge build                                    # first build greenfield on PG
-knowledge ask "..."                                # all verbs route to PG from this cwd
+knowledge config show
+knowledge db ping
+knowledge db init-postgres
+knowledge build
+knowledge ask "..."
 ```
 
-Alternative: drop the `.knowledge.yaml` at `$HOME` to make PG the laptop default for every project that doesn't override.
+Alternative: drop `.knowledge.yaml` at `$HOME` to make PG the laptop default for projects that don't override.
 
-### Migrating an existing SQLite project
+Makefile helpers: `make pg-stop`, `make pg-logs`, `make pg-psql`, `make pg-clean` (destructive — wipes data volume).
+
+#### Migrating an existing SQLite project
 
 The local SQLite copy stays untouched — `migrate` only writes to the target.
 
 ```bash
-knowledge db migrate --project <name|abs-path> --dry-run    # see the plan
-knowledge db migrate --project <name|abs-path>              # interactive confirm
-knowledge db migrate --project <name|abs-path> --yes        # scripts/CI
+knowledge db migrate --project <name|abs-path> --dry-run
+knowledge db migrate --project <name|abs-path>
+knowledge db migrate --project <name|abs-path> --yes
 
-knowledge forget <name> --sqlite-only                       # drop the local copy after verifying the PG one
+knowledge forget <name> --sqlite-only
 ```
 
-`migrate` keys on the project's `git remote` URL (normalized: strip credentials, drop `.git`, lowercase host, ssh→https) so the same repo cloned at different paths on different laptops collapses to one row on PG. Falls back to `root_path` when there's no `.git`.
+`migrate` keys on the project's `git remote` URL (normalized) so the same repo at different paths collapses to one row on PG. Falls back to `root_path` when there's no `.git`.
 
-### Credentials
+#### Credentials
 
-Never in `.knowledge.yaml`. Each laptop exports its own `KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` ([template](knowledge/config.example.env)). The YAML carries env-var **names** only — committed configs can't leak secrets even if checked in.
+Never in `.knowledge.yaml`. Each laptop exports its own `KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD` ([template](knowledge/config.example.env)). The YAML carries env-var **names** only.
 
 `KNOWLEDGE_DATABASE_URL` is the CI escape hatch (full libpq URL with credentials inline). Don't use it on laptops.
 
-### Plan + design notes
+Design notes: [`todo/01-postgresql-shared-mode.md`](todo/01-postgresql-shared-mode.md).
 
-`todo/01-postgresql-shared-mode.md` — schema, ID-remap, advisory lock strategy, identity rules.
+</details>
+
+<details>
+<summary><strong>Configuration reference</strong></summary>
+
+### Configuration reference
+
+```bash
+knowledge config init              # ~/.knowledge.yaml (laptop default)
+knowledge config init --project    # <git-root>/.knowledge.yaml
+knowledge config show
+knowledge config check-env
+
+knowledge db ping
+knowledge db init-postgres
+knowledge db migrate --project <name> [--dry-run] [--yes]
+```
+
+Templates: [`knowledge/config.example.yaml`](knowledge/config.example.yaml), [`knowledge/config.example.env`](knowledge/config.example.env).
+
+Override data directory for tests: `KNOWLEDGE_HOME`.
+
+</details>
+
+<details>
+<summary><strong>Development & internals</strong></summary>
+
+### Development & internals
+
+See [`knowledge/README.md`](knowledge/README.md) for the module map.
+
+```bash
+make guide          # quick install reminder
+make pg-run         # local PostgreSQL dev container
+pip install -e '.[dev]'
+```
+
+License: [AGPL-3.0](LICENSE).
+
+</details>
