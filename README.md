@@ -39,7 +39,38 @@ Prefix natural-language queries with a *kind hint* when you know what you're loo
 | Helm template | `helm template:` | `helm_template` |
 | README / doc section | `docs:` | `markdown_section` |
 
-[Full query-enrichment table ↓](#query-enrichment-full)
+
+## Query enrichment (full table)
+
+<details id="query-enrichment-full">
+<summary><strong>Full table</strong></summary>
+
+
+The embedding model retrieves best when the query hints at *what kind of thing* is being sought. Prefix user queries based on intent; add `--kind` when irrelevant kinds crowd results.
+
+| User is looking for | Prefix the query with | Good `--kind` filter |
+|---|---|---|
+| Python function body | `python function:` | `function` or `big_parent` |
+| Python class | `python class:` | `class` |
+| Python method | `python method:` | `method` |
+| JS / TS function | `javascript function:` | `function` |
+| Terraform resource | `terraform resource:` | `resource` |
+| Terraform variable / output | `terraform variable:` / `terraform output:` | `variable` / `output` |
+| Terraform module | `terraform module:` | `module` |
+| Terraform locals | `terraform locals:` | `locals_block` or `locals_entry` |
+| Ansible task | `ansible task:` | `ansible_task` |
+| Ansible handler | `ansible handler:` | `ansible_handler` |
+| Helm template | `helm template:` | `helm_template` |
+| Helm values key | `helm values:` | `helm_values_section` |
+| K8s manifest | `kubernetes Deployment:` (etc.) | `yaml_doc` + `--lang yaml` |
+| Shell function | `shell function:` | `shell_function` |
+| Jinja macro or block | `jinja:` | `jinja_macro` / `jinja_block` |
+| Dockerfile stage | `dockerfile stage:` | `dockerfile_stage` |
+| Markdown doc / README | `docs:` | `markdown_section` |
+| Config value / literal | `value:` | (no filter) |
+| Docstring / doc comment | `docstring:` | (no filter) |
+
+</details>
 
 ---
 
@@ -135,39 +166,6 @@ knowledge path <chunk_id>
 ```
 
 By default, queries scope to the current repo (`git rev-parse --show-toplevel`). Use `--all-projects` to search across every registered repo.
-
-</details>
-
-<details id="query-enrichment-full">
-<summary><strong>Query enrichment (full table)</strong></summary>
-
-### Query enrichment (full table)
-
-The embedding model retrieves best when the query hints at *what kind of thing* is being sought. Prefix user queries based on intent; add `--kind` when irrelevant kinds crowd results.
-
-| User is looking for | Prefix the query with | Good `--kind` filter |
-|---|---|---|
-| Python function body | `python function:` | `function` or `big_parent` |
-| Python class | `python class:` | `class` |
-| Python method | `python method:` | `method` |
-| JS / TS function | `javascript function:` | `function` |
-| Terraform resource | `terraform resource:` | `resource` |
-| Terraform variable / output | `terraform variable:` / `terraform output:` | `variable` / `output` |
-| Terraform module | `terraform module:` | `module` |
-| Terraform locals | `terraform locals:` | `locals_block` or `locals_entry` |
-| Ansible task | `ansible task:` | `ansible_task` |
-| Ansible handler | `ansible handler:` | `ansible_handler` |
-| Helm template | `helm template:` | `helm_template` |
-| Helm values key | `helm values:` | `helm_values_section` |
-| K8s manifest | `kubernetes Deployment:` (etc.) | `yaml_doc` + `--lang yaml` |
-| Shell function | `shell function:` | `shell_function` |
-| Jinja macro or block | `jinja:` | `jinja_macro` / `jinja_block` |
-| Dockerfile stage | `dockerfile stage:` | `dockerfile_stage` |
-| Markdown doc / README | `docs:` | `markdown_section` |
-| Config value / literal | `value:` | (no filter) |
-| Docstring / doc comment | `docstring:` | (no filter) |
-
-</details>
 
 <details>
 <summary><strong>Dependency graph</strong></summary>
