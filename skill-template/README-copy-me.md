@@ -1,18 +1,43 @@
 # Skill templates — copy into your repo
 
-This directory ships two skills for Claude Code:
+`SKILL.md` is the **single source of truth** for the knowledge instruction file. The other
+two files here are *generated* from it (via `make sync-skill`) so each coding agent gets the
+content in the format it discovers:
 
-- **`knowledge`** (file: `SKILL.md`) — the main semantic search skill. `/knowledge <question>` auto-builds/updates the index, enriches the query, returns the matching chunks.
+| File | Read by | Form |
+|------|---------|------|
+| `SKILL.md` | Claude Code | YAML frontmatter (`name`/`description`/…) + body |
+| `AGENTS.md` | Codex, OpenCode, Cursor (root fallback) | plain prose, no frontmatter |
+| `knowledge.mdc` | Cursor (native scoped rule) | `.mdc` frontmatter + body |
+
+This directory also ships an optional second skill:
 - **`knowledge-bench`** (dir: `knowledge-bench/SKILL.md`) — A/B comparison. `/knowledge-bench <question>` answers the same question twice (once with grep only, once with `knowledge`) and prints a side-by-side verdict.
 
 ## Install
 
-### Main skill (required)
+The easiest path is the bundled installer, which writes the right file for each tool:
 
 ```bash
+knowledge install-skill                       # Claude Code → .claude/skills/knowledge/SKILL.md
+knowledge install-skill --ide cursor          # → .cursor/rules/knowledge.mdc
+knowledge install-skill --ide codex,opencode  # → ./AGENTS.md (shared, merge-safe)
+knowledge install-skill --ide all             # all four
+knowledge install-skill --ide all --symlink   # link instead of copy (follows upstream updates)
+```
+
+### Manual copy (equivalent)
+
+```bash
+# Claude Code
 mkdir -p .claude/skills/knowledge
-cp ~/git/repo-knowledge/skill-template/SKILL.md \
-   .claude/skills/knowledge/SKILL.md
+cp ~/git/repo-knowledge/skill-template/SKILL.md .claude/skills/knowledge/SKILL.md
+
+# Cursor
+mkdir -p .cursor/rules
+cp ~/git/repo-knowledge/skill-template/knowledge.mdc .cursor/rules/knowledge.mdc
+
+# Codex / OpenCode (root AGENTS.md)
+cp ~/git/repo-knowledge/skill-template/AGENTS.md ./AGENTS.md
 ```
 
 ### Benchmark skill (optional)
@@ -23,7 +48,7 @@ cp ~/git/repo-knowledge/skill-template/knowledge-bench/SKILL.md \
    .claude/skills/knowledge-bench/SKILL.md
 ```
 
-Adjust the source path if you cloned `repo-knowledge` elsewhere. Symlinks work too (`ln -s $(realpath …)`) if you want upstream skill updates to follow automatically.
+Adjust the source path if you cloned `repo-knowledge` elsewhere. Symlinks work too (`ln -s $(realpath …)`) if you want upstream updates to follow automatically. **Do not hand-edit `AGENTS.md` / `knowledge.mdc`** — edit `SKILL.md` and run `make sync-skill`.
 
 ## What each skill does
 

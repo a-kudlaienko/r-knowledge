@@ -443,12 +443,20 @@ def main(argv: list[str] | None = None) -> int:
     # install-skill
     p_install = sub.add_parser(
         "install-skill",
-        help="Copy SKILL.md into .claude/skills/knowledge/ (project or user)",
+        help="Wire the knowledge skill into one or more IDEs (Claude/Cursor/Codex/OpenCode)",
+    )
+    p_install.add_argument(
+        "--ide",
+        default="claude",
+        help=(
+            "Comma-separated target IDEs: claude,cursor,codex,opencode (or 'all'). "
+            "Default: claude — .claude/skills/knowledge/SKILL.md"
+        ),
     )
     p_install.add_argument(
         "--user",
         action="store_true",
-        help="Install to ~/.claude/skills/knowledge/ instead of cwd",
+        help="Install to the user/global location for each IDE instead of the cwd repo",
     )
     p_install.add_argument(
         "--symlink",
@@ -456,9 +464,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Symlink the source instead of copying (auto-updates on git pull)",
     )
     p_install.add_argument(
+        "--always-apply",
+        action="store_true",
+        help="Cursor only: set alwaysApply: true in the .mdc (default: false, agent-requested)",
+    )
+    p_install.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing SKILL.md at the target",
+        help="Overwrite an existing dedicated skill file (SKILL.md / .mdc) at the target",
     )
 
     # config — runtime settings (storage mode, PG DSN status). Phase 0 of
@@ -1746,51 +1759,172 @@ def _cmd_forget_sqlite_only(args: argparse.Namespace) -> int:
     return 0
 
 
+# Markers that delimit the knowledge block inside a (possibly user-owned)
+# AGENTS.md, so re-installs replace only our content and never clobber prose the
+# user added around it.
+_AGENTS_BLOCK_BEGIN = "<!-- BEGIN knowledge skill (managed by `knowledge install-skill`) -->"
+_AGENTS_BLOCK_END = "<!-- END knowledge skill -->"
+
+# Per-IDE install matrix. `dest` is relative to the cwd repo (project scope) or
+# to $HOME (user scope). `dedicated` files are ours alone (copy/symlink, --force
+# to overwrite); non-dedicated files (AGENTS.md) are merged via a managed block
+# because users commonly keep their own content there.
+_IDE_TARGETS = {
+    "claude": {
+        "sibling": "SKILL.md",
+        "project_dest": Path(".claude/skills/knowledge/SKILL.md"),
+        "user_dest": Path(".claude/skills/knowledge/SKILL.md"),
+        "dedicated": True,
+    },
+    "cursor": {
+        "sibling": "knowledge.mdc",
+        "project_dest": Path(".cursor/rules/knowledge.mdc"),
+        "user_dest": None,  # Cursor has no stable user-global rules file
+        "dedicated": True,
+    },
+    "codex": {
+        "sibling": "AGENTS.md",
+        "project_dest": Path("AGENTS.md"),
+        "user_dest": Path(".codex/AGENTS.md"),
+        "dedicated": False,
+    },
+    "opencode": {
+        "sibling": "AGENTS.md",
+        "project_dest": Path("AGENTS.md"),
+        "user_dest": Path(".config/opencode/AGENTS.md"),
+        "dedicated": False,
+    },
+}
+
+
+def _parse_ides(raw: str) -> list[str] | None:
+    """Expand the --ide value into an ordered, de-duplicated list of IDE keys."""
+    tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if "all" in tokens:
+        return list(_IDE_TARGETS)
+    out: list[str] = []
+    for t in tokens:
+        if t not in _IDE_TARGETS:
+            print(
+                f"error: unknown IDE '{t}'. choose from: "
+                f"{', '.join(_IDE_TARGETS)}, all",
+                file=sys.stderr,
+            )
+            return None
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def _merge_agents_block(target: Path, body: str) -> str:
+    """Insert/replace the managed knowledge block in an AGENTS.md, returning status."""
+    block = f"{_AGENTS_BLOCK_BEGIN}\n{body.rstrip()}\n{_AGENTS_BLOCK_END}\n"
+    if not (target.exists() and not target.is_symlink()):
+        target.write_text(block, encoding="utf-8")
+        return "created"
+    existing = target.read_text(encoding="utf-8")
+    start = existing.find(_AGENTS_BLOCK_BEGIN)
+    if start != -1:
+        end = existing.find(_AGENTS_BLOCK_END, start)
+        if end != -1:
+            end += len(_AGENTS_BLOCK_END)
+            # consume a single trailing newline so re-runs don't accumulate them
+            if end < len(existing) and existing[end] == "\n":
+                end += 1
+            merged = existing[:start] + block + existing[end:]
+            target.write_text(merged, encoding="utf-8")
+            return "block replaced"
+    sep = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
+    target.write_text(existing + sep + block, encoding="utf-8")
+    return "block appended (existing content preserved)"
+
+
 def cmd_install_skill(args: argparse.Namespace) -> int:
-    """Copy (or symlink) the bundled SKILL.md into the project or user skills dir."""
+    """Install the knowledge skill into one or more IDEs (copy, symlink, or merge)."""
     import shutil
 
-    src = Path(__file__).resolve().parent.parent / "skill-template" / "SKILL.md"
-    if not src.is_file():
+    from . import skill_render
+
+    src_dir = Path(__file__).resolve().parent.parent / "skill-template"
+    skill_path = src_dir / "SKILL.md"
+    if not skill_path.is_file():
         print(
-            f"error: skill template not found at {src}\n"
+            f"error: skill template not found at {skill_path}\n"
             "expected the repo-knowledge repo layout (editable install).",
             file=sys.stderr,
         )
         return 1
 
-    if args.user:
-        target_dir = Path.home() / ".claude" / "skills" / "knowledge"
-    else:
-        target_dir = Path.cwd() / ".claude" / "skills" / "knowledge"
-    target = target_dir / "SKILL.md"
+    ides = _parse_ides(args.ide)
+    if ides is None:
+        return 2
 
-    if target.exists() or target.is_symlink():
-        if not args.force:
-            print(
-                f"error: {target} already exists. Re-run with --force to overwrite.",
-                file=sys.stderr,
-            )
-            return 1
-        target.unlink()
+    skill_text = skill_path.read_text(encoding="utf-8")
+    base = Path.home() if args.user else Path.cwd()
+    rc = 0
+    seen_dests: set[Path] = set()
 
-    target_dir.mkdir(parents=True, exist_ok=True)
+    for ide in ides:
+        spec = _IDE_TARGETS[ide]
+        dest_rel = spec["user_dest"] if args.user else spec["project_dest"]
+        if dest_rel is None:
+            print(f"note: {ide} has no user-global location — skipping (try without --user).")
+            continue
+        target = (base / dest_rel).resolve()
 
-    if args.symlink:
-        target.symlink_to(src)
-        mode = f"symlinked → {src}"
-    else:
-        shutil.copyfile(src, target)
-        mode = "copied"
+        # codex + opencode share ./AGENTS.md — write it once.
+        if target in seen_dests:
+            print(f"note: {ide} shares {dest_rel} with an already-written target — skipping.")
+            continue
+        seen_dests.add(target)
 
-    print(f"installed skill: {target}  ({mode})")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sibling = src_dir / spec["sibling"]
+
+        if spec["dedicated"]:
+            if target.exists() or target.is_symlink():
+                if not args.force:
+                    print(
+                        f"error: {target} already exists. Re-run with --force to overwrite.",
+                        file=sys.stderr,
+                    )
+                    rc = 1
+                    continue
+                target.unlink()
+            if args.symlink:
+                target.symlink_to(sibling)
+                mode = f"symlinked → {sibling}"
+            elif ide == "cursor":
+                target.write_text(
+                    skill_render.render_cursor(skill_text, always_apply=args.always_apply),
+                    encoding="utf-8",
+                )
+                mode = "rendered"
+            else:  # claude — SKILL.md verbatim
+                shutil.copyfile(skill_path, target)
+                mode = "copied"
+            print(f"[{ide}] installed: {target}  ({mode})")
+        else:
+            # AGENTS.md — shared, user-owned-friendly merge.
+            if args.symlink and not (target.exists() or target.is_symlink()):
+                target.symlink_to(sibling)
+                print(f"[{ide}] installed: {target}  (symlinked → {sibling})")
+            else:
+                if args.symlink:
+                    print(
+                        f"[{ide}] {target} already exists — merging a managed block "
+                        "instead of symlinking (can't symlink alongside your content)."
+                    )
+                status = _merge_agents_block(target, skill_render.render_agents(skill_text))
+                print(f"[{ide}] installed: {target}  ({status})")
+
     print()
     print("next steps:")
     if args.user:
-        print("  the `/knowledge` skill is now available in every project.")
+        print("  the knowledge skill is now available in every project for the chosen IDEs.")
     else:
-        print("  the `/knowledge` skill is now available in this project.")
-        print("  commit .claude/skills/knowledge/SKILL.md if you want teammates to share it.")
+        print("  the knowledge skill is now available in this project for the chosen IDEs.")
+        print("  commit the installed file(s) if you want teammates to share them.")
     print("  from a repo root, run `knowledge build` once to index the code.")
 
     # Hint when this scope resolves to shared_postgresql — agents picking up
@@ -1801,7 +1935,7 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
     try:
         s = settings_mod.load_settings()
     except settings_mod.SettingsError:
-        return 0
+        return rc
     if s.mode == "shared_postgresql":
         print()
         print(
@@ -1809,7 +1943,7 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
             f"({s.config_source}) — verify the laptop has env vars exported:"
         )
         print("  knowledge config check-env")
-    return 0
+    return rc
 
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:

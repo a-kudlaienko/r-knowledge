@@ -1,3 +1,8 @@
+---
+description: Local code cartography + semantic search for the current repo. Navigate (find / grep), orient (why / map / brief), search (ask — hybrid FTS+vector+rerank, cached), and remember across sessions (decide / resume). Auto-builds or updates the local index. Use BEFORE raw Grep / Read for anything meaning-shaped.
+alwaysApply: false
+---
+
 <!-- Generated from skill-template/SKILL.md by `make sync-skill` (python -m knowledge.skill_render) — do not edit by hand. -->
 
 # /knowledge — Code cartography + semantic search + session memory

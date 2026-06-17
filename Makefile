@@ -1,4 +1,4 @@
-.PHONY: guide clean build install-local test-integration \
+.PHONY: guide clean build install-local test-integration sync-skill \
         pg-build pg-run pg-stop pg-logs pg-psql pg-clean _check-pg-env
 
 PACKAGE_NAME := repo-knowledge
@@ -27,6 +27,12 @@ clean:
 # lightweight build+smoke CI.
 test-integration:
 	bash tests/integration/shared_pg/run.sh
+
+# Regenerate the per-IDE skill siblings (AGENTS.md, knowledge.mdc) from the
+# canonical skill-template/SKILL.md. Run after editing SKILL.md;
+# tests/test_skill_sync.py fails CI if these drift.
+sync-skill:
+	python -m knowledge.skill_render
 
 build: clean
 	python -m pip install --upgrade build

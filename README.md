@@ -212,16 +212,30 @@ Use `ask` for code questions, not history search.
 </details>
 
 <details>
-<summary>🤖 <strong>Claude Code integration</strong></summary>
+<summary>🤖 <strong>Agent / IDE integration (Claude Code, Cursor, Codex, OpenCode)</strong></summary>
 
-**Skill** — wire `/knowledge` into a project or your user profile:
+The `knowledge` CLI is tool-agnostic — any agent that can run a shell uses it the same way. `install-skill` wires the *instruction file* into the location each tool discovers, all generated from one source (`skill-template/SKILL.md`):
 
 ```bash
-knowledge install-skill              # project → .claude/skills/knowledge/SKILL.md
-knowledge install-skill --user       # user    → ~/.claude/skills/knowledge/SKILL.md
-knowledge install-skill --symlink    # auto-updates on git pull here
-knowledge install-skill --force      # overwrite existing
+knowledge install-skill                          # default → Claude Code (.claude/skills/knowledge/SKILL.md)
+knowledge install-skill --ide cursor             # → .cursor/rules/knowledge.mdc
+knowledge install-skill --ide codex,opencode     # → ./AGENTS.md  (shared; written once)
+knowledge install-skill --ide all                # all four at once
+knowledge install-skill --ide all --user         # user/global location per tool
+knowledge install-skill --ide claude --symlink   # auto-updates on git pull here
+knowledge install-skill --ide cursor --force     # overwrite an existing dedicated file
 ```
+
+| `--ide` | Project destination | `--user` (global) |
+|---------|--------------------|-------------------|
+| `claude` (default) | `.claude/skills/knowledge/SKILL.md` | `~/.claude/skills/knowledge/SKILL.md` |
+| `cursor` | `.cursor/rules/knowledge.mdc` | *(project only)* |
+| `codex` | `AGENTS.md` | `~/.codex/AGENTS.md` |
+| `opencode` | `AGENTS.md` | `~/.config/opencode/AGENTS.md` |
+
+`codex` and `opencode` (and Cursor as a fallback) all read the same root **`AGENTS.md`** — it's written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved. Dedicated files (`SKILL.md`, `.mdc`) need `--force` to overwrite. Cursor's `.mdc` is an *agent-requested* rule by default (`alwaysApply: false`); pass `--always-apply` to attach it to every request.
+
+> 🔧 Maintainers: `AGENTS.md` and `knowledge.mdc` are generated from `SKILL.md` — run `make sync-skill` after editing it (CI guards drift via `tests/test_skill_sync.py`).
 
 Auto-builds on first use, auto-updates on file changes, prefers `ask`/`find`/`grep`/`why`/`map`/`brief`/`resume`/`decide`.
 
