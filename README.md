@@ -67,6 +67,36 @@ knowledge ask "how does X work?"
 
 > 💡 **Sharpen retrieval** by prefixing queries with a *kind hint*: `python function:`, `terraform resource:`, `ansible task:`, `helm template:`, `docs:`. → [full table in Details ↓](#-details)
 
+<details>
+<summary>🗂️ <strong>Supported languages & formats</strong></summary>
+
+Every file below is **chunked and semantically searchable**. A subset also gets a
+**dependency-relations graph** (`knowledge relations <file>` — imports, callers, blast
+radius). Files in languages without a dedicated chunker are still indexed at a coarser
+granularity; `.gitignore` + `.knowledgeignore` are always honored.
+
+| Language / format | Searchable (chunked) | Dependency graph (relations) |
+|---|:---:|---|
+| **Python** | ✅ | ✅ `import` / `from` / `importlib` / relative |
+| **JavaScript / TypeScript** | ✅ | ✅ `import` / `require()` / dynamic `import()` |
+| **Terraform / HCL** | ✅ | ✅ `module.source` / `templatefile()` / `file()` |
+| **Ansible** (YAML) | ✅ | ✅ playbooks / `include_*` / roles / modules (honors `ansible.cfg`) |
+| **Helm** (YAML) | ✅ | ✅ `Chart.yaml` deps / `{{ include }}` / `{{ template }}` |
+| **Kustomize** (YAML) | ✅ | ✅ `resources` / `bases` / `components` / patches / generators |
+| **GitHub Actions** (YAML) | ✅ | ✅ reusable workflows / composite actions / `owner/repo@ref` |
+| **ArgoCD** (YAML) | ✅ | ✅ App-of-Apps source references |
+| **Kubernetes / plain YAML** | ✅ | ➖ siblings hint only (no resolver) |
+| **JSON** | ✅ | ➖ |
+| **Shell** | ✅ | ➖ |
+| **Jinja2** | ✅ | ➖ (Jinja edges surface via Ansible/Helm) |
+| **Dockerfile** | ✅ | ➖ |
+| **Markdown** | ✅ | ➖ |
+
+Dynamic relation paths (e.g. `include_tasks: "_tasks/{{ deploy_env }}/…"`) resolve once you
+set the variables — see [Dependency graph ↓](#-details).
+
+</details>
+
 ---
 
 ## 📚 Details
