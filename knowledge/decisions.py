@@ -25,6 +25,7 @@ from typing import NamedTuple
 from . import config, db
 from .db import Connection
 from .embedder import get_embedder
+from .sanitizer import scrub_text
 
 
 class Decision(NamedTuple):
@@ -69,6 +70,13 @@ def add(
     ``supersedes`` / ``override_reason`` are set together only when this
     decision overrides a prior one (the CLI enforces the justification).
     """
+    # Scrub secrets from all free-text fields before embedding and storage.
+    # topic is usually a short slug but can carry leaked values from user
+    # shell history; rationale is optional prose — both are scrubbed cheaply.
+    topic = scrub_text(topic)
+    decision = scrub_text(decision)
+    if rationale is not None:
+        rationale = scrub_text(rationale)
     text_to_embed = f"{topic} :: {decision}"
     vec = get_embedder().encode([text_to_embed])[0]
     files_json = json.dumps(files_touched) if files_touched else None

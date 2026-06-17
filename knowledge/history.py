@@ -32,6 +32,7 @@ from typing import NamedTuple
 from . import config, db
 from .db import Connection
 from .embedder import get_embedder
+from .sanitizer import scrub_text
 
 
 class HistoryEntry(NamedTuple):
@@ -64,6 +65,8 @@ def add(
     table untouched. Callers ingesting many entries should use
     ``ingest_stage`` instead — it batches the encode call.
     """
+    short_summary = scrub_text(short_summary)
+    long_summary = scrub_text(long_summary)
     vec = get_embedder().encode([short_summary])[0]
     with db.transaction(conn):
         now = time.time()
@@ -213,11 +216,18 @@ def _insert_entries(
     """Encode short summaries in one batch and insert all rows in one
     APSW savepoint. Caller decides what to do with the source file.
     """
-    shorts = [e["short"] for e in entries]
+    # Scrub secrets before embedding and storage — so both the vector and the
+    # stored text reflect the sanitized version. Done over a copy so the
+    # caller's list is not mutated (entries may be re-used on error retry).
+    clean_entries = [
+        {**e, "short": scrub_text(e["short"]), "long": scrub_text(e["long"])}
+        for e in entries
+    ]
+    shorts = [e["short"] for e in clean_entries]
     vecs = get_embedder().encode(shorts)
     with db.transaction(conn):  # all-or-nothing for this batch
         now = time.time()
-        for obj, vec in zip(entries, vecs):
+        for obj, vec in zip(clean_entries, vecs):
             new_id = db.execute_returning_id(
                 conn,
                 "INSERT INTO history("

@@ -17,6 +17,13 @@ CHUNKER_VERSION = "2"
 # Embedding model. BAAI/bge-small-en-v1.5: 384-dim, ~130MB, strong MTEB
 # score for mixed code+text retrieval, 512-token window.
 MODEL = "BAAI/bge-small-en-v1.5"
+# Pinned to the exact HuggingFace commit that is already on disk.
+# Supply-chain safety: floating "main" would re-download whatever the hub
+# currently serves — a compromised or MITM'd repo could swap in a pickle
+# (.bin) variant and achieve RCE on the first ``encode`` call.
+# Confirmed from local cache:
+#   ~/.knowledge/models/models--BAAI--bge-small-en-v1.5/snapshots/<sha>/
+MODEL_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 EMBEDDING_DIM = 384
 
 # Chunk size threshold. Above this, split into big_parent + big_subchunks.

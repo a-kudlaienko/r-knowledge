@@ -17,7 +17,16 @@ def user_dir() -> Path:
     """Return ``~/.knowledge/`` (creating it on first access)."""
     override = os.environ.get("KNOWLEDGE_HOME")
     root = Path(override).expanduser() if override else Path.home() / ".knowledge"
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # M4: mkdir's mode is masked by the umask and ignored when the dir already
+    # exists, so enforce 0o700 explicitly. This dir holds the index (cached
+    # source), the model cache, and buffered work-notes/decisions; a 0o700 gate
+    # on the parent keeps every file underneath unreadable by other local users
+    # on a shared/multi-user host even if individual files are 0o644.
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
     return root
 
 
@@ -92,6 +101,10 @@ def _slugify_root(root: Path) -> str:
         c if (c.isalnum() or c == "-") else "-"
         for c in root.name.lower()
     ).strip("-") or "proj"
+    # L3: cap the basename so ``<base>-<8hex>`` stays well under the 255-byte
+    # filename limit (ext4/HFS+ raise ENAMETOOLONG otherwise, breaking every
+    # command that needs the project stage dir). The hash keeps it unique.
+    base = base[:200]
     return f"{base}-{digest}"
 
 

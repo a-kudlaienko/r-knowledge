@@ -416,7 +416,7 @@ knowledge config show              # which file is active + resolved mode
 
 ```bash
 # Container / CI: one variable, no config file — PostgreSQL is selected by the DSN itself.
-export KNOWLEDGE_DATABASE_URL="postgresql://knowledge:s3cret@db.example.com:5432/knowledge?sslmode=require"
+export KNOWLEDGE_DATABASE_URL="postgresql://knowledge:<PASSWORD>@db.example.com:5432/knowledge?sslmode=verify-full"
 
 knowledge db ping                 # confirms it reached PostgreSQL (reports server + pgvector)
 knowledge build && knowledge ask "how does X work?"

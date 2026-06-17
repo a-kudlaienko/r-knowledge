@@ -34,6 +34,30 @@ class Embedder:
             import os
             import warnings
 
+            # Resolve model name: honour user override from settings, fall
+            # back to the built-in default.
+            from . import settings as settings_mod
+            try:
+                _s = settings_mod.load_settings()
+                _user_model = (_s.embedding_model or "").strip()
+            except Exception:
+                _user_model = ""
+
+            if _user_model:
+                # User supplied their own model — revision and safetensors
+                # are their trust decision; we don't pin or override.
+                model_name = _user_model
+                model_revision = None
+                model_kwargs: dict = {}
+            else:
+                # Default model: pin to the verified on-disk commit SHA
+                # (supply-chain safety — see config.MODEL_REVISION).
+                # Prefer safetensors over pickle (.bin) for the same reason:
+                # safetensors is mmapped and cannot execute code on load.
+                model_name = config.MODEL
+                model_revision = config.MODEL_REVISION
+                model_kwargs = {"use_safetensors": True}
+
             # The model is downloaded once and cached at paths.models_dir().
             # Every subsequent process load reads from disk, not network.
             #
@@ -45,7 +69,7 @@ class Embedder:
             # skip the update check entirely. On first run the env var is
             # NOT set, so the download proceeds normally; every run after
             # that is purely disk-bound.
-            model_slug = config.MODEL.replace("/", "--")
+            model_slug = model_name.replace("/", "--")
             model_dir = paths.models_dir() / f"models--{model_slug}"
             if model_dir.exists():
                 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -65,8 +89,10 @@ class Embedder:
             from sentence_transformers import SentenceTransformer
 
             self._model = SentenceTransformer(
-                config.MODEL,
+                model_name,
                 cache_folder=str(paths.models_dir()),
+                revision=model_revision,
+                model_kwargs=model_kwargs or None,
             )
 
     def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:

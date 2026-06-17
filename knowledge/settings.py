@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -45,6 +47,18 @@ _DEFAULT_PASSWORD_ENV = "KNOWLEDGE_PG_PASSWORD"
 # "I'll just put my password in here for testing" footgun before any network
 # call.
 _FORBIDDEN_TOP_LEVEL = ("password", "user")
+
+# Exhaustive set of values accepted by libpq's sslmode parameter.
+_VALID_SSLMODES = frozenset(
+    {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+)
+
+# sslmode values that do NOT authenticate the server certificate (weaker than
+# verify-ca).  Used to emit the one-time H4 warning for remote hosts.
+_WEAK_SSLMODES = frozenset({"disable", "allow", "prefer", "require"})
+
+# Emitted at most once per process so bulk DSN-construction loops are quiet.
+_tls_warned: bool = False
 
 # Template written by ``knowledge config init`` (see cli.cmd_config_init).
 # Lives here as a Python constant so ``knowledge/`` ships only ``*.py`` — no
@@ -92,7 +106,7 @@ class Settings:
     mode: StorageMode = "sqlite"
     postgresql: PostgresSettings | None = None
     cache_bytes: int = 2 * 1024 * 1024 * 1024
-    embedding_model: str | None = None
+    embedding_model: str | None = None  # consumed by embedder._ensure_loaded()
     config_source: str = "default"
 
 
@@ -248,11 +262,18 @@ def _parse_storage_block(
             f"mode == 'shared_postgresql'"
         )
 
+    sslmode = pg_block.get("sslmode", "require")
+    if sslmode not in _VALID_SSLMODES:
+        raise SettingsError(
+            f"{source}: storage.postgresql.sslmode {sslmode!r} is not valid; "
+            f"must be one of: {', '.join(sorted(_VALID_SSLMODES))}"
+        )
+
     pg_settings = PostgresSettings(
         host=host or "",
         port=int(pg_block.get("port", 5432)),
         database=pg_block.get("database", "knowledge"),
-        sslmode=pg_block.get("sslmode", "require"),
+        sslmode=sslmode,
         user_env=pg_block.get("user_env", _DEFAULT_USER_ENV),
         password_env=pg_block.get("password_env", _DEFAULT_PASSWORD_ENV),
         connect_timeout_seconds=int(
@@ -333,13 +354,41 @@ def resolve_pg_dsn(settings: Settings) -> str:
             "KNOWLEDGE_DATABASE_URL for a one-shot CI override."
         )
 
-    # URL-encode user/password — passwords can contain ``@``, ``/``, ``:``,
-    # which are libpq DSN delimiters and would silently corrupt parsing.
+    # URL-encode user, password, host, and database — all four can contain
+    # ``@``, ``/``, ``:`` which are libpq URL delimiters and would silently
+    # corrupt parsing if left verbatim.  port and connect_timeout are already
+    # int()-coerced in the PostgresSettings constructor so no encoding needed.
+    _emit_tls_warning(pg.host, pg.sslmode)
     return (
         f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
-        f"@{pg.host}:{pg.port}/{pg.database}?sslmode={pg.sslmode}"
+        f"@{quote(pg.host, safe='')}:{pg.port}"
+        f"/{quote(pg.database, safe='')}"
+        f"?sslmode={pg.sslmode}"
         f"&connect_timeout={pg.connect_timeout_seconds}"
     )
+
+
+def _emit_tls_warning(host: str, sslmode: str) -> None:
+    """Emit a one-time stderr warning when the server certificate is not verified.
+
+    Only fires for non-localhost targets (empty host string is treated as
+    localhost by libpq).  Never prints the DSN or any credential.
+    The module-level ``_tls_warned`` flag ensures the message appears at most
+    once per process even if many DSNs are assembled in a batch.
+    """
+    global _tls_warned
+    if _tls_warned:
+        return
+    _localhost = {"localhost", "127.0.0.1", "::1", ""}
+    if host in _localhost:
+        return
+    if sslmode in _WEAK_SSLMODES:
+        print(
+            f"warning: sslmode={sslmode} does not verify the server certificate; "
+            "for remote hosts prefer sslmode=verify-full",
+            file=sys.stderr,
+        )
+        _tls_warned = True
 
 
 def mask_dsn(dsn: str) -> str:
@@ -364,13 +413,15 @@ def mask_dsn(dsn: str) -> str:
             user = creds
         masked_user = (user[:3] + "***") if user else "***"
         return f"{dsn[:scheme_end]}{masked_user}{host_part}"
-    out: list[str] = []
-    for part in dsn.split():
-        if part.lower().startswith("password="):
-            out.append("password=***")
-        else:
-            out.append(part)
-    return " ".join(out)
+    # Keyword form: mask the password value regardless of quoting style or
+    # embedded spaces.  Single-quoted, double-quoted, and bare (space-delimited)
+    # values are all handled by the alternation below.
+    return re.sub(
+        r"password\s*=\s*('[^']*'|\"[^\"]*\"|\S+)",
+        "password=***",
+        dsn,
+        flags=re.IGNORECASE,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ def walk_project(root: Path) -> Iterator[tuple[Path, str]]:
     difference between 2 seconds and 2 minutes.
     """
     spec = load_specs(root)
+    root_resolved = root.resolve()
 
     for dirpath, dirnames, filenames in os.walk(root):
         dir_path = Path(dirpath)
@@ -53,6 +54,18 @@ def walk_project(root: Path) -> Iterator[tuple[Path, str]]:
                 continue
 
             p = dir_path / fname
+            # M5: a file symlink can point outside the repo (e.g. a planted
+            # 'creds.conf -> ~/.aws/credentials'). Indexing it would pull
+            # external secrets into the DB and, in shared mode, replicate them
+            # to teammates. Permit in-repo symlinks (target stays under root);
+            # skip any whose target escapes the project. (os.walk already does
+            # not descend directory symlinks — followlinks defaults to False.)
+            if p.is_symlink():
+                try:
+                    if not p.resolve().is_relative_to(root_resolved):
+                        continue
+                except OSError:
+                    continue
             lang = classify_file(p)
             if lang is None:
                 continue

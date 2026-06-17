@@ -27,8 +27,11 @@ markdown secondary headings) is a future polish, not in scope here.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from . import config
 from .chunkers.base import Chunk
+from .sanitizer import scrub_text
 
 
 def split_if_oversized(chunk: Chunk, max_chars: int | None = None) -> list[Chunk]:
@@ -43,14 +46,28 @@ def split_if_oversized(chunk: Chunk, max_chars: int | None = None) -> list[Chunk
     if len(chunk.text) <= limit:
         return [chunk]
 
-    sub_chunks = _line_window_split(chunk, limit)
+    # Security (H5): scrub BEFORE splitting. A multi-line secret (e.g. a PEM
+    # private key) can be longer than one window; if we split first and let the
+    # indexer scrub each subchunk independently, the BEGIN line lands in one
+    # subchunk and the END line in the next, so neither matches the
+    # ``-----BEGIN ... -----END-----`` regex and the key material leaks into
+    # the stored text + embeddings. Scrubbing the full text up front guarantees
+    # no window can carry a partial secret. We split a clone carrying the
+    # scrubbed text but the SAME byte offsets, so the parent keeps the original
+    # full byte span (``--raw`` reassembly via the parent is unaffected; only
+    # per-subchunk byte offsets shift, and only for files that actually held a
+    # secret — those bytes are re-read from disk by ``--raw`` anyway).
+    scrubbed = scrub_text(chunk.text)
+    split_source = chunk if scrubbed == chunk.text else replace(chunk, text=scrubbed)
+
+    sub_chunks = _line_window_split(split_source, limit)
     if len(sub_chunks) <= 1:
         # Single logical line is already longer than the limit (generated
         # dict, minified code, etc.). No meaningful split possible — keep
-        # the original intact rather than emit a useless parent+singleton.
+        # the original intact; the indexer scrubs it with full context.
         return [chunk]
 
-    parent = _make_big_parent(chunk, sub_chunks)
+    parent = _make_big_parent(split_source, sub_chunks)
     for i, sc in enumerate(sub_chunks):
         sc.parent_idx = 0       # position of parent in the returned list
         sc.sibling_order = i

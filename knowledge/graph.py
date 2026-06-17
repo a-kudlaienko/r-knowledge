@@ -43,6 +43,14 @@ from .db import Connection
 _VIS_NETWORK_CDN = (
     "https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"
 )
+# M3: Subresource Integrity hash for the pinned vis-network bundle. The browser
+# refuses to execute the script if the bytes fetched from the CDN don't match,
+# closing the CDN-compromise / MITM supply-chain vector. Regenerate when the
+# pinned version above changes:
+#   curl -sSL <url> | openssl dgst -sha384 -binary | openssl base64 -A
+_VIS_NETWORK_SRI = (
+    "sha384-yxKDWWf0wwdUj/gPeuL11czrnKFQROnLgY8ll7En9NYoXibgg3C6NK/UDHNtUgWJ"
+)
 
 
 class GraphNode(NamedTuple):
@@ -517,7 +525,17 @@ def _render_html(
         "nodes": node_dicts,
         "edges": edge_dicts,
     }
-    payload_json = json.dumps(payload, separators=(",", ":"))
+    # H3 fix: json.dumps does NOT escape '<', '>', or '/' by default.
+    # A repo file literally named '</script>' would break out of the
+    # enclosing <script> element and execute arbitrary JS.  Unicode-escape
+    # all three so the JSON is still valid but can never terminate a script
+    # block.  Applies to every field in the payload (label, group, …).
+    payload_json = (
+        json.dumps(payload, separators=(",", ":"))
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("/", "\\u002f")
+    )
 
     # One string, no extra Python templating engine — ``.format`` is
     # rejected by the JS braces we'd have to double-escape. Use
@@ -528,6 +546,7 @@ def _render_html(
         "edge_count": len(edges),
         "legend": legend_html,
         "vis_url": _VIS_NETWORK_CDN,
+        "vis_sri": _VIS_NETWORK_SRI,
         "payload": payload_json,
     }
 
@@ -618,7 +637,7 @@ _TEMPLATE = """<!DOCTYPE html>
     <div id="legend">%(legend)s</div>
   </div>
   <div id="network"></div>
-  <script src="%(vis_url)s"></script>
+  <script src="%(vis_url)s" integrity="%(vis_sri)s" crossorigin="anonymous"></script>
   <script>
     const data = %(payload)s;
     // vis-network 5+ treats ``title`` as plain text by default (XSS

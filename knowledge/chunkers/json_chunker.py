@@ -19,7 +19,7 @@ from pathlib import Path
 
 from tree_sitter_languages import get_parser
 
-from ..sanitizer import CHANGE_ME, is_sensitive_key
+from ..sanitizer import CHANGE_ME, is_sensitive_key, scrub_text
 from .base import BaseChunker, Chunk
 
 
@@ -42,7 +42,7 @@ class JsonChunker(BaseChunker):
                     order += 1
             return out
 
-        # Root is an array / scalar — emit whole-file chunk.
+        # Root is an array / scalar — emit whole-file chunk with full scrubbing.
         return [self._whole_chunk(root_value, source_bytes)]
 
     # ---- helpers ----------------------------------------------------------
@@ -79,18 +79,33 @@ class JsonChunker(BaseChunker):
             sibling_order=sibling_order,
         )
 
-    @staticmethod
-    def _whole_chunk(root_value, source_bytes: bytes) -> Chunk:
-        text_bytes = source_bytes[root_value.start_byte : root_value.end_byte]
+    def _whole_chunk(self, root_value, source_bytes: bytes) -> Chunk:
+        """Emit a single chunk for array/scalar roots.
+
+        Applies the same two-layer sanitisation as ``_pair_chunk``:
+        * Layer 2 (key-based): walks the subtree via ``_collect_sensitive_spans``
+          so that array elements like ``[{"password": "S3cr3t"}]`` are scrubbed.
+        * Layer 1 (regex): ``scrub_text`` catches inline secrets not covered by
+          the key-based walk (e.g. raw tokens in string values).
+        """
+        chunk_start = root_value.start_byte
+        chunk_end = root_value.end_byte
+        raw_text = source_bytes[chunk_start:chunk_end].decode("utf-8", errors="replace")
+
+        spans: list[tuple[int, int, str]] = []
+        self._collect_sensitive_spans(root_value, source_bytes, chunk_start, spans)
+        sanitized = _apply_replacements(raw_text, spans)
+        sanitized = scrub_text(sanitized)  # layer-1 pass as final safety net
+
         return Chunk(
             kind="json_object",
             name=None,
             qualified_name=None,
             start_line=root_value.start_point[0] + 1,
             end_line=root_value.end_point[0] + 1,
-            start_byte=root_value.start_byte,
-            end_byte=root_value.end_byte,
-            text=text_bytes.decode("utf-8", errors="replace"),
+            start_byte=chunk_start,
+            end_byte=chunk_end,
+            text=sanitized,
         )
 
     def _collect_sensitive_spans(

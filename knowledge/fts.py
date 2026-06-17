@@ -16,7 +16,9 @@ the symbol+text style queries we run, top-K substance overlaps heavily.
 
 from __future__ import annotations
 
+import contextlib
 import re
+import signal
 
 from . import config, db
 from .db import Connection
@@ -236,6 +238,40 @@ def _to_tsquery(pattern: str) -> str:
     return " | ".join(parts)
 
 
+@contextlib.contextmanager
+def _regex_time_budget(seconds: int = 5):
+    """Abort a runaway user regex (L1: ReDoS).
+
+    Python's ``re`` has no match-time timeout, so a pathological
+    ``--regex '(a+)+'`` against a long symbol name can spin for seconds in C.
+    Bound the whole match loop with a SIGALRM so a malicious/typo'd pattern
+    can't hang the CLI. SIGALRM is Unix + main-thread only; where it's
+    unavailable (Windows, non-main thread) we silently run without the guard.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _on_timeout(signum, frame):
+        raise ValueError(
+            f"regex match exceeded {seconds}s — pattern is too expensive "
+            "(possible catastrophic backtracking); narrow it or use grep"
+        )
+
+    try:
+        old = signal.signal(signal.SIGALRM, _on_timeout)
+    except ValueError:
+        # Not the main thread — can't install the handler; run unguarded.
+        yield
+        return
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def _find_regex(
     conn: Connection,
     pattern: str,
@@ -271,12 +307,13 @@ def _find_regex(
         ORDER BY c.id ASC
     """
     out: list[SearchResult] = []
-    for row in db.fetch_all(conn, sql, tuple(params)):
-        name, qname = row[2], row[3]
-        if (name and rx.search(name)) or (qname and rx.search(qname)):
-            out.append(_row_to_result(row))
-            if len(out) >= limit:
-                break
+    with _regex_time_budget():
+        for row in db.fetch_all(conn, sql, tuple(params)):
+            name, qname = row[2], row[3]
+            if (name and rx.search(name)) or (qname and rx.search(qname)):
+                out.append(_row_to_result(row))
+                if len(out) >= limit:
+                    break
     return out
 
 

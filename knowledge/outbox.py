@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db, decisions, history, paths, projects
+from .sanitizer import scrub_text
 
 # Accepted entry kinds → the module whose ``add`` replays them.
 _KINDS = ("decision", "history")
@@ -46,6 +47,20 @@ def append(kind: str, root: Path, payload: dict[str, Any]) -> Path:
     """
     if kind not in _KINDS:
         raise ValueError(f"unknown outbox kind {kind!r}")
+    # Scrub secrets from the free-text memory fields before writing to disk.
+    # Structural fields (kind, ts, root, files_touched list, session_id, author,
+    # supersedes, override_reason) are left intact — only prose that can carry
+    # embedded secrets is touched.  Done on a shallow copy so the caller's dict
+    # is not mutated.
+    payload = dict(payload)
+    if kind == "history":
+        for field in ("short_summary", "long_summary"):
+            if isinstance(payload.get(field), str):
+                payload[field] = scrub_text(payload[field])
+    elif kind == "decision":
+        for field in ("topic", "decision", "rationale"):
+            if isinstance(payload.get(field), str):
+                payload[field] = scrub_text(payload[field])
     path = paths.outbox_file(root)
     entry = {"kind": kind, "ts": time.time(), "root": str(root), "payload": payload}
     line = json.dumps(entry, default=str) + "\n"

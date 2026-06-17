@@ -552,8 +552,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_hooks.add_argument(
         "--absolute",
-        action="store_true",
-        help="Use the absolute path to `knowledge` (robust against PATH quirks on GUI launches)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write the absolute path to `knowledge` (default; robust against "
+        "PATH hijacking and GUI-launch PATH quirks). Use --no-absolute to write "
+        "the bare 'knowledge' command instead.",
     )
 
     args = parser.parse_args(argv)
@@ -578,10 +581,43 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _warn_project_pg_redirect() -> None:
+    """Warn when a repo-local config silently redirects storage to a remote PG (H2a).
+
+    The cwd-walk-up config resolution is intentional (closer file wins), but a
+    cloned/untrusted repo can ship a ``.knowledge-config.json`` pointing storage
+    at an attacker-controlled PostgreSQL host — exfiltrating the indexed source
+    and the env-var PG credentials' auth exchange. We do not block (that would
+    break the legitimate team-mode workflow); we make the redirect visible.
+    KNOWLEDGE_DATABASE_URL and the home config are explicit user choices and are
+    not flagged.
+    """
+    from . import settings as settings_mod
+
+    try:
+        s = settings_mod.load_settings()
+    except settings_mod.SettingsError:
+        return
+    if s.mode != "shared_postgresql" or s.postgresql is None:
+        return
+    if not s.config_source.endswith(paths.PROJECT_CONFIG_NAME):
+        return
+    host = s.postgresql.host or ""
+    if host in {"", "localhost", "127.0.0.1", "::1"}:
+        return
+    print(
+        f"warning: project-local {paths.PROJECT_CONFIG_NAME} is redirecting "
+        f"storage to postgresql://{host} — indexed source and your PostgreSQL "
+        "credentials will be sent there. Ctrl-C now if this repo is untrusted.",
+        file=sys.stderr,
+    )
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     from . import indexer, outbox
 
     root = projects.current_project_root()
+    _warn_project_pg_redirect()
     proposed_name = args.name or root.name
     print(f"building index for: {root}", flush=True)
 
@@ -650,6 +686,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     from . import indexer, outbox
 
     root = projects.current_project_root()
+    _warn_project_pg_redirect()
     print(f"updating index for: {root}", flush=True)
     t0 = time.time()
     with db.connect() as conn:
@@ -1372,6 +1409,24 @@ def _format_bytes(size: int) -> str:
     return f"{s:.1f}TB"
 
 
+def _contained_abs_path(project_root: str, rel_path: str) -> Path | None:
+    """Resolve ``project_root / rel_path`` and confirm it stays inside the root.
+
+    Security guard (H1): chunk rows carry ``rel_path`` / ``project_root`` from the
+    database. On a SHARED PostgreSQL backend those rows are written by teammates
+    and are therefore untrusted input to every other user's CLI. An absolute
+    ``rel_path`` (``/etc/shadow``), a ``../`` traversal, or a ``project_root`` of
+    ``/`` would otherwise make ``get --raw`` / ``path`` read or disclose arbitrary
+    local files. Returns the resolved path only when it is contained within the
+    resolved project root; otherwise ``None``.
+    """
+    root_resolved = Path(project_root).resolve()
+    candidate = (root_resolved / rel_path).resolve()
+    if not candidate.is_relative_to(root_resolved):
+        return None
+    return candidate
+
+
 def cmd_get(args: argparse.Namespace) -> int:
     from . import search as search_mod
 
@@ -1390,9 +1445,15 @@ def cmd_get(args: argparse.Namespace) -> int:
 
     (cid, kind, name, qname, sl, el, sb, eb, stored, rel_path, project_root,
      _parent_id) = row
-    abs_path = Path(project_root) / rel_path
 
     if args.raw:
+        abs_path = _contained_abs_path(project_root, rel_path)
+        if abs_path is None:
+            print(
+                f"error: chunk path escapes project root: {rel_path!r}",
+                file=sys.stderr,
+            )
+            return 1
         try:
             with open(abs_path, "rb") as f:
                 f.seek(sb)
@@ -1424,11 +1485,17 @@ def _emit_family(family: list, *, raw: bool) -> int:
     parent = family[0]
     (_, kind, name, _sl, _el, sb, eb, _stored, rel_path, project_root,
      _sib) = parent
-    abs_path = Path(project_root) / rel_path
 
     if raw:
         # Parent's byte range covers the whole original — one disk read
         # reassembles exactly what was on disk at build time.
+        abs_path = _contained_abs_path(project_root, rel_path)
+        if abs_path is None:
+            print(
+                f"error: chunk path escapes project root: {rel_path!r}",
+                file=sys.stderr,
+            )
+            return 1
         try:
             with open(abs_path, "rb") as f:
                 f.seek(sb)
@@ -1466,7 +1533,14 @@ def cmd_path(args: argparse.Namespace) -> int:
         return 1
     (_cid, _kind, _name, _qname, sl, el, _sb, _eb, _stored, rel_path, project_root,
      _parent_id) = row
-    print(f"{Path(project_root) / rel_path}:{sl}-{el}")
+    abs_path = _contained_abs_path(project_root, rel_path)
+    if abs_path is None:
+        print(
+            f"error: chunk path escapes project root: {rel_path!r}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{abs_path}:{sl}-{el}")
     return 0
 
 
@@ -1836,18 +1910,35 @@ _HOOK_CMD_SUFFIX = "knowledge history ingest"
 
 
 def _resolve_hook_command(absolute: bool) -> str:
-    """Return the shell command string written into settings.json."""
+    """Return the shell command string written into settings.json.
+
+    Defaults to the ABSOLUTE path of the ``knowledge`` binary (M1). Writing a
+    bare ``knowledge`` into a hook that auto-fires every turn is a PATH-hijack
+    vector: anything earlier on ``$PATH`` (a ``.``-in-PATH entry, a compromised
+    venv ``bin/``, a project-local ``./knowledge``) would run on every Claude
+    Code interaction. ``--no-absolute`` opts back into the bare command.
+    """
     if not absolute:
         return _HOOK_CMD_SUFFIX
     import shutil
     resolved = shutil.which("knowledge")
     if resolved is None:
         print(
-            "warning: --absolute requested but 'knowledge' not on PATH; "
-            "falling back to bare command.",
+            "warning: 'knowledge' not found on PATH; writing the bare command. "
+            "Re-run from an environment where `knowledge` resolves, or pass "
+            "--no-absolute deliberately.",
             file=sys.stderr,
         )
         return _HOOK_CMD_SUFFIX
+    # Surface (don't block) when the resolved binary lives somewhere that could
+    # itself be attacker-influenced — a virtualenv or a path under cwd.
+    markers = ("/.venv/", "/venv/", "/site-packages/", "/node_modules/")
+    if any(m in resolved for m in markers) or resolved.startswith(str(Path.cwd())):
+        print(
+            f"note: hook will call {resolved} — verify this path is trusted "
+            "(it sits inside a virtualenv or the current project tree).",
+            file=sys.stderr,
+        )
     return f"{resolved} history ingest"
 
 
@@ -1997,6 +2088,19 @@ def cmd_history_ingest(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         stage = Path(args.stage_file).expanduser()
+        # L5: --stage-file accepts an arbitrary path whose entries are inserted
+        # under the current project. Surface (don't block) an out-of-tree file so
+        # a scripted/hook caller can't quietly ingest untrusted JSONL.
+        try:
+            stage_dir_root = paths.stage_dir().resolve()
+            if not stage.resolve().is_relative_to(stage_dir_root):
+                print(
+                    f"note: ingesting a stage file outside {stage_dir_root}: "
+                    f"{stage.resolve()}",
+                    file=sys.stderr,
+                )
+        except (OSError, AttributeError):
+            pass
         if not stage.exists() or not stage.read_text(encoding="utf-8").strip():
             print(f"stage is empty: {stage}")
             return 0
@@ -2602,6 +2706,13 @@ def cmd_graph(args: argparse.Namespace) -> int:
         if args.output
         else Path.cwd() / "relations_graph.html"
     )
+    # L4: --output writes (and mkdir-parents) to any user-supplied path. Warn
+    # when the target escapes the current working tree so a stray/relative
+    # ``../../`` can't silently clobber a file elsewhere.
+    abs_target = out_path.resolve()
+    if not abs_target.is_relative_to(Path.cwd().resolve()):
+        print(f"note: writing graph outside the current directory: {abs_target}",
+              file=sys.stderr)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_str, encoding="utf-8")
     # Echo the absolute path (not the input form) so tmux copy-paste

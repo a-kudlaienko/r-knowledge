@@ -38,7 +38,15 @@ SECRET_PATTERNS: dict[str, re.Pattern[str]] = {
         r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"
     ),
     "ssh_authorized_key":    re.compile(
-        r"(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp\d+)\s+[A-Za-z0-9+/=]{100,}"
+        # Floor lowered to 40 chars so Ed25519 (~68-char base64 body) is caught;
+        # RSA (372+ chars) and ECDSA nistp256 (~108 chars) still match as before.
+        r"(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp\d+)\s+[A-Za-z0-9+/=]{40,}"
+    ),
+    "slack_token":           re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    "stripe_secret_key":     re.compile(r"sk_live_[0-9a-zA-Z]{24,}"),
+    # Connection strings that embed credentials inline: scheme://user:pass@host
+    "dsn_with_credentials":  re.compile(
+        r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^:@/\s]+:[^@/\s]+@[^\s/]+"
     ),
 }
 
@@ -73,8 +81,13 @@ def scrub_text(text: str) -> str:
 
 
 def is_sensitive_key(key: str) -> bool:
-    """Layer-2 predicate for structured-data chunkers."""
-    k = key.lower()
+    """Layer-2 predicate for structured-data chunkers.
+
+    Normalises hyphens to underscores before matching so that ``api-key``,
+    ``client-secret``, and ``private-key`` are caught alongside their
+    underscore equivalents already listed in ``SENSITIVE_KEYS``.
+    """
+    k = key.lower().replace("-", "_")
     return any(s in k for s in SENSITIVE_KEYS)
 
 

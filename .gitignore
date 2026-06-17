@@ -4,6 +4,12 @@ __pycache__/
 build/
 dist/
 *.env
+# Per-project storage config — may name a remote PG host / topology; keep it
+# out of the published repo so a contributor can't commit theirs by accident.
+.knowledge-config.json
+# Local index databases — never publish a built index.
+*.sqlite
+*.sqlite3
 .venv/
 venv/
 .pytest_cache/
