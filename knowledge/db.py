@@ -17,6 +17,7 @@ than silently migrating — better UX for a local tool).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Iterable
 
 import apsw
 import sqlite_vec
@@ -601,6 +602,44 @@ def insert_chunk_embedding(conn, chunk_id: int, vec) -> None:
         "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, ?)",
         (chunk_id, vec.tobytes()),
     )
+
+
+def insert_chunk_embeddings_bulk(conn, rows: Iterable[tuple[int, Any]]) -> int:
+    """Bulk-insert ``(chunk_id, embedding)`` pairs. Returns row count.
+
+    PostgreSQL: a single ``COPY chunk_embeddings FROM STDIN`` — vectors go
+    over the wire as pgvector's text literal ``[v1,v2,...]``. One round-trip
+    for the whole batch instead of N; on remote / LB-fronted PG this is the
+    difference between a multi-minute hang and a few seconds. Rows are
+    streamed from the iterator so RAM stays bounded on huge builds.
+
+    SQLite: falls back to the existing single-row insert into ``chunks_vec``.
+    APSW ``executemany`` against a vec0 virtual table isn't exercised
+    anywhere in this codebase, and the SQLite path is always local — the
+    round-trip cost the COPY path solves does not apply.
+    """
+
+    if current_mode() == "postgresql":
+        n = 0
+        with conn.cursor() as cur:
+            with cur.copy(
+                "COPY chunk_embeddings(chunk_id, embedding) FROM STDIN"
+            ) as copy:
+                for chunk_id, vec in rows:
+                    # ``.tolist()`` upcasts numpy float32 to Python float;
+                    # ``str()`` on a float preserves full repr precision.
+                    vec_str = "[" + ",".join(str(v) for v in vec.tolist()) + "]"
+                    copy.write_row((chunk_id, vec_str))
+                    n += 1
+        return n
+    n = 0
+    for chunk_id, vec in rows:
+        conn.execute(
+            "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, ?)",
+            (chunk_id, vec.tobytes()),
+        )
+        n += 1
+    return n
 
 
 def delete_chunk_embeddings_for_project(conn, project_id: int) -> None:

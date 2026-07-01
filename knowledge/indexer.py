@@ -162,14 +162,19 @@ def build_project(
                 embed_queue.append((cid, stored))
 
         # Batch-embed outside the per-file loop to maximize throughput.
+        # On shared PG the bulk helper collapses N single-row INSERTs into
+        # one COPY — the difference between minutes and seconds on any
+        # non-local database (LB, WAN, cloud PG).
         if embed_queue:
             if verbose:
                 print(f"embedding {len(embed_queue)} chunks...", flush=True)
             embedder = get_embedder()
             texts = [t for (_, t) in embed_queue]
             vectors = embedder.encode(texts)
-            for (cid, _), vec in zip(embed_queue, vectors):
-                db.insert_chunk_embedding(conn, cid, vec)
+            db.insert_chunk_embeddings_bulk(
+                conn,
+                ((cid, vec) for (cid, _), vec in zip(embed_queue, vectors)),
+            )
 
         # Auto-discover ansible inventory variables before edges resolve,
         # so templated paths (``{{ deploy_env }}/main.yml``) substitute
@@ -363,14 +368,19 @@ def update_project(
             # files cascade-deletes chunks AND file_edges (ON DELETE CASCADE)
 
         # Batch-embed just the chunks that were actually new/changed.
+        # Bulk helper: one COPY on PG, single-row loop on SQLite (see
+        # db.insert_chunk_embeddings_bulk for why the SQLite path stays
+        # per-row).
         if embed_queue:
             if verbose:
                 print(f"embedding {len(embed_queue)} chunks...", flush=True)
             embedder = get_embedder()
             texts = [t for (_, t) in embed_queue]
             vectors = embedder.encode(texts)
-            for (cid, _), vec in zip(embed_queue, vectors):
-                db.insert_chunk_embedding(conn, cid, vec)
+            db.insert_chunk_embeddings_bulk(
+                conn,
+                ((cid, vec) for (cid, _), vec in zip(embed_queue, vectors)),
+            )
 
         # Auto-discover ansible inventory variables before edges resolve.
         # Even when no source files changed, an edited group_vars/all.yml
