@@ -41,6 +41,9 @@ from . import db as _db
 from .db import Connection
 from .resolvers import Edge, dispatch_resolver
 
+# Column order for file_edges rows returned by resolve_edges:
+#   (project_id, source_file_id, target_file_id, kind, raw, symbol, line)
+
 
 # Extensions a bare JS/TS import specifier is allowed to resolve to. Must
 # match what the scanner actually indexes — if the scanner doesn't know
@@ -225,6 +228,75 @@ def wipe_file(conn: Connection, source_file_id: int) -> None:
     )
 
 
+def resolve_edges(
+    index: "FileIndex",
+    source_file_id: int,
+    source_rel: str,
+    lang: str,
+    edges: Iterable[Edge],
+) -> list[tuple]:
+    """Resolve a file's edges to ``file_edges`` row tuples — PURE, no DB.
+
+    Returns rows in column order::
+
+        (project_id, source_file_id, target_file_id, kind, raw, symbol, line)
+
+    Applies the same drop/resolve rules as :func:`insert_edges`:
+
+    * ``helm_define`` / ``tf_decl`` edges are dropped (metadata only).
+    * ``unresolved`` kind or no resolver → ``target_file_id = None``.
+    * Calls ``resolver_fn(e, index, source_rel)`` for resolvable edges.
+    * Falls back to :func:`_try_substitute_and_resolve` when the resolver
+      misses on an edge whose ``raw`` carries a template expression.
+    * ``ansible_module`` edges that remain unresolved after all fallbacks
+      are dropped (builtins / stdlib noise).
+
+    ``project_id`` is taken from ``index.project_id``.  The function never
+    touches the database.
+    """
+    edges = list(edges)
+    if not edges:
+        return []
+
+    resolver_fn = _resolver_for(lang)
+    rows: list[tuple] = []
+
+    for e in edges:
+        # ``helm_define`` is metadata consumed by FileIndex.prepare, not a
+        # real dependency.  ``tf_decl`` is the Terraform analogue — both
+        # consumed by prepare(), never written to file_edges.
+        if e.kind in ("helm_define", "tf_decl"):
+            continue
+
+        if e.kind == "unresolved" or resolver_fn is None:
+            target_id = None
+        else:
+            target_id = resolver_fn(e, index, source_rel)
+
+        # Variable substitution fallback.
+        if target_id is None and resolver_fn is not None and e.kind != "unresolved":
+            target_id = _try_substitute_and_resolve(
+                e, index, source_rel, resolver_fn
+            )
+
+        # Unresolved ansible_module = builtin / stdlib noise — drop.
+        if e.kind == "ansible_module" and target_id is None:
+            continue
+
+        rows.append(
+            (
+                index.project_id,
+                source_file_id,
+                target_id,
+                e.kind,
+                e.raw,
+                e.symbol,
+                e.line,
+            )
+        )
+    return rows
+
+
 def extract_edges(
     raw_bytes: bytes,
     abs_path: Path,
@@ -259,72 +331,24 @@ def insert_edges(
 ) -> int:
     """Resolve + persist a file's edges. Wipes prior edges first.
 
-    Returns the number of rows inserted. Edges with ``kind='unresolved'``
-    bypass resolution and land with ``target_file_id=NULL`` preserving
-    their ``raw`` expression. Everything else runs through the language's
-    resolver; misses land with ``target_file_id=NULL`` and are reported
-    as ``external`` at query time.
+    Returns the number of rows inserted. Delegates resolution to the pure
+    :func:`resolve_edges` helper, then writes each row individually.
+    Edges with ``kind='unresolved'`` bypass resolution and land with
+    ``target_file_id=NULL`` preserving their ``raw`` expression.
+    Everything else runs through the language's resolver; misses land with
+    ``target_file_id=NULL`` and are reported as ``external`` at query time.
     """
     wipe_file(conn, source_file_id)
-
-    edges = list(edges)
-    if not edges:
-        return 0
-
-    resolver_fn = _resolver_for(lang)
-
-    inserted = 0
-    for e in edges:
-        # ``helm_define`` is metadata consumed by FileIndex.prepare, not
-        # a real dependency. Drop without persisting. ``tf_decl`` is the
-        # Terraform analogue — consumed by prepare() to build tf_decls,
-        # never written to file_edges.
-        if e.kind in ("helm_define", "tf_decl"):
-            continue
-
-        if e.kind == "unresolved" or resolver_fn is None:
-            target_id = None
-        else:
-            target_id = resolver_fn(e, index, source_rel)
-
-        # Variable substitution fallback. When a resolver returned NULL
-        # but the raw carries Jinja/Terraform templates, try substituting
-        # the project's variables and re-running the resolver on the
-        # substituted path. Keeps ``apply_variables`` (the explicit
-        # re-resolution pass) and the build pipeline consistent —
-        # whether a variable was set before or after build, the result
-        # is the same once the resolver runs.
-        if target_id is None and resolver_fn is not None and e.kind != "unresolved":
-            target_id = _try_substitute_and_resolve(
-                e, index, source_rel, resolver_fn
-            )
-
-        # ``ansible_module`` is emitted for every task's module key —
-        # most of those are stdlib / builtin modules (``debug``,
-        # ``set_fact``, ``copy``, ``template``). Without a resolution
-        # to a project file, keeping them clutters the graph with 100s
-        # of noise edges per playbook. Drop unresolved ones; the LLM
-        # query surface stays focused on custom-module usage.
-        if e.kind == "ansible_module" and target_id is None:
-            continue
-
+    rows = resolve_edges(index, source_file_id, source_rel, lang, edges)
+    for row in rows:
         _db.execute(
             conn,
             "INSERT INTO file_edges("
             "project_id, source_file_id, target_file_id, kind, raw, symbol, line"
             ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                index.project_id,
-                source_file_id,
-                target_id,
-                e.kind,
-                e.raw,
-                e.symbol,
-                e.line,
-            ),
+            row,
         )
-        inserted += 1
-    return inserted
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,42 @@ Answers *meaning* questions — *"how does vault auth work?"*, *"where is the in
 - **🤝 Keeps a team in sync via one shared PostgreSQL.** Everyone shares a single index, history, and decision log. You see *why* a choice was made, and get a gated warning **before** feature A re-opens a problem feature B already solved — so dev B's work doesn't silently break the main logic or overrule a teammate's standard. And secrets stay safe: tokens, passwords, and keys are **sanitized to `CHANGE_ME` before anything is embedded or written to the shared DB**, so nothing sensitive ever lands in the team index.
 
 <details>
+<summary>🗺️ <strong>How it works (at a glance)</strong></summary>
+
+```mermaid
+flowchart TB
+    files["Your repo — source files"]
+    subgraph ingest["1 · Index — knowledge build / update"]
+        direction LR
+        scan["scan<br/>gitignore-aware"] --> chunk["chunk<br/>tree-sitter"] --> scrub["sanitize<br/>secrets → CHANGE_ME"] --> embed["embed<br/>local model"]
+    end
+    subgraph store["2 · Store — SQLite (local) or shared PostgreSQL (team)"]
+        direction LR
+        d1[("chunks<br/>+ full-text")]
+        d2[("vector<br/>embeddings")]
+        d3[("dependency<br/>edges")]
+        d4[("decisions<br/>+ work log")]
+    end
+    subgraph query["3 · Query — every question"]
+        direction LR
+        q1["find<br/>exact symbol"]
+        q2["grep<br/>full-text"]
+        q3["ask<br/>vector + text + rerank"]
+        q4["map · why · relations"]
+        q5["resume · decide"]
+    end
+    user(["You / AI agent — CLI or skill"])
+    files --> ingest
+    ingest --> store
+    store --> query
+    query --> user
+```
+
+**Index once, query many.** `build` / `update` scan → chunk → sanitize (secrets → `CHANGE_ME`) → embed, then write the whole batch at once — **one `COPY` per table on PostgreSQL, `executemany` on SQLite** — so indexing cost is independent of repo size and a remote/LB-fronted team DB stays fast. Every query then reads only the slices it needs; the repo is never re-scanned to answer a question.
+
+</details>
+
+<details>
 <summary>🕸️ <strong>How the dependency graph works — and why it's better than a full graph tree</strong></summary>
 
 The relations graph is a **flat, file-granularity edge list**, not a materialized
@@ -253,9 +289,12 @@ knowledge relations stats
 knowledge vars set ansible deploy_env=prod region=us-east
 knowledge vars set terraform env=prod
 knowledge vars list [--scope ansible] [--json]
+knowledge vars unset --auto             # clear all auto-loaded rows
 ```
 
 Scoped by domain (`ansible`/`terraform`/`helm`/`all`); mutations auto-apply. Unresolved edges show as `parametric`.
+
+**Auto-load from inventory.** For Ansible, every `build`/`update` reads `group_vars/all.{yml,yaml,/}` and `host_vars/*.{yml,yaml}` at the project root, every `ansible.cfg` directory, and every `inventory =` directory referenced by a cfg, then upserts them into `scope='ansible'` with `source='auto:group_vars'` / `'auto:host_vars'`. Precedence follows the [official Ansible docs](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_variables.html): inventory `group_vars/all` < playbook `group_vars/all` < inventory `host_vars/*` < playbook `host_vars/*`. Manual `vars set` rows always win — auto rows never stomp them. Vault-encrypted files are skipped with a warning. Out of scope: `group_vars/<group>.yml` for groups other than `all`, role `defaults/main.yml`.
 
 **Visualize:** `knowledge graph [--output file.html] [--open]` — self-contained HTML, nodes colored by directory.
 
@@ -471,6 +510,8 @@ knowledge forget <name> --sqlite-only
 **Credentials never touch the config file** — export `KNOWLEDGE_PG_USER` / `KNOWLEDGE_PG_PASSWORD`; the JSON carries env-var *names* only. For containers / CI, a single `KNOWLEDGE_DATABASE_URL` (full DSN, creds inline) selects PostgreSQL by itself — no config file needed → [details ↓](#-details).
 
 **Concurrency & offline resilience.** Multiple teammates on one DB never block each other: reads are lock-free, and `build`/`update` take a *non-blocking* per-project advisory lock — a concurrent index run on the same project fails fast (exit 3, retry) rather than waiting, so deadlock can't happen. If the shared DB is unreachable, `decide` and `history add` **buffer locally** (`~/.knowledge/stage/<slug>/outbox.jsonl`) and **auto-sync** on the next reachable command — you never lose a decision or hit a traceback. Reads exit cleanly (code 4) with a "shared index unreachable" message; index writes just re-run when the DB is back (chunks are re-derivable).
+
+**Fast on a remote DB.** `build` and `update` write in bulk — one `COPY` per table (chunks, embeddings, files, edges) plus set-based `UPDATE` / `DELETE` — so the number of network round-trips is **independent of repo size**. A full build or a large `update` is a handful of round-trips, not thousands, which is what makes an LB-fronted / cross-datacenter PostgreSQL practical. SQLite runs the identical code path via `executemany`; locally it's all in-process.
 
 </details>
 

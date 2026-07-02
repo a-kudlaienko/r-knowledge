@@ -74,6 +74,7 @@ class Variable(NamedTuple):
     name: str
     value: str
     updated_at: float
+    source: str
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +107,114 @@ def set_many(
             db.execute(
                 conn,
                 "INSERT INTO project_variables("
-                "project_id, scope, name, value, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "project_id, scope, name, value, source, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'manual', ?, ?) "
                 "ON CONFLICT(project_id, scope, name) DO UPDATE SET "
-                "value = excluded.value, updated_at = excluded.updated_at",
+                "value = excluded.value, source = 'manual', "
+                "updated_at = excluded.updated_at",
                 (project_id, scope, name, value, now, now),
             )
     return len(pairs)
+
+
+# Source label format: 'manual' for explicit `vars set`, or
+# 'auto:<origin>' for indexer-driven inserts (e.g. 'auto:group_vars',
+# 'auto:host_vars'). The 'auto:' prefix is the contract `set_auto` uses
+# to decide whether a row is safe to overwrite.
+_AUTO_SOURCE_PREFIX = "auto:"
+
+
+def set_auto(
+    conn: Connection,
+    project_id: int,
+    scope: str,
+    pairs: dict[str, str],
+    source: str,
+) -> int:
+    """Insert/update auto-discovered variables; never stomp manual ones.
+
+    Used by the indexer when reading ``group_vars/all*`` / ``host_vars/*``.
+    Every auto write is guarded by ``WHERE source LIKE 'auto:%'`` on the
+    UPSERT update path, so a row that was previously set with
+    ``knowledge vars set …`` (``source='manual'``) is left untouched.
+
+    Both SQLite (UPSERT WHERE on DO UPDATE) and PostgreSQL support this
+    syntax. Returns the number of (name, value) pairs the caller asked
+    to apply — NOT the number actually written, which is harder to
+    determine portably (sqlite's changes() vs psycopg's rowcount diverge
+    when ON CONFLICT skips the row). Callers should only check this for
+    "did we attempt anything?" not "how many really moved".
+    """
+    _validate_scope(scope)
+    if not source.startswith(_AUTO_SOURCE_PREFIX):
+        raise ValueError(
+            f"set_auto source must start with {_AUTO_SOURCE_PREFIX!r}; "
+            f"got {source!r}"
+        )
+    if not pairs:
+        return 0
+    now = time.time()
+    with db.transaction(conn):
+        for name, value in pairs.items():
+            _validate_name(name)
+            if not isinstance(value, str):
+                value = str(value)
+            db.execute(
+                conn,
+                "INSERT INTO project_variables("
+                "project_id, scope, name, value, source, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id, scope, name) DO UPDATE SET "
+                "value = excluded.value, source = excluded.source, "
+                "updated_at = excluded.updated_at "
+                "WHERE project_variables.source LIKE 'auto:%'",
+                (project_id, scope, name, value, source, now, now),
+            )
+    return len(pairs)
+
+
+def delete_stale_auto(
+    conn: Connection,
+    project_id: int,
+    source: str,
+    kept_names: set[str],
+) -> int:
+    """Drop auto rows for ``source`` whose name is no longer in ``kept_names``.
+
+    Manual rows are left alone (the WHERE clause only matches the exact
+    auto-source label). Run this after ``set_auto`` so a key removed from
+    a YAML file disappears on the next index pass.
+
+    Returns the number of rows deleted.
+    """
+    _validate_scope_or_raise = None  # placeholder so linter stays quiet
+    del _validate_scope_or_raise
+    if not source.startswith(_AUTO_SOURCE_PREFIX):
+        raise ValueError(
+            f"delete_stale_auto source must start with "
+            f"{_AUTO_SOURCE_PREFIX!r}; got {source!r}"
+        )
+    # No names → wipe every auto row for this source. Useful for "force
+    # re-discover" semantics when the YAML files all disappeared.
+    if not kept_names:
+        return db.execute(
+            conn,
+            "DELETE FROM project_variables "
+            "WHERE project_id = ? AND source = ?",
+            (project_id, source),
+        )
+    placeholders = ",".join("?" for _ in kept_names)
+    params: list[object] = [project_id, source]
+    params.extend(kept_names)
+    return db.execute(
+        conn,
+        f"DELETE FROM project_variables "
+        f"WHERE project_id = ? AND source = ? "
+        f"AND name NOT IN ({placeholders})",
+        tuple(params),
+    )
 
 
 def unset(
@@ -159,18 +261,37 @@ def list_vars(
         _validate_scope(scope)
         rows = db.fetch_all(
             conn,
-            "SELECT scope, name, value, updated_at FROM project_variables "
+            "SELECT scope, name, value, updated_at, source "
+            "FROM project_variables "
             "WHERE project_id = ? AND scope = ? ORDER BY name",
             (project_id, scope),
         )
     else:
         rows = db.fetch_all(
             conn,
-            "SELECT scope, name, value, updated_at FROM project_variables "
+            "SELECT scope, name, value, updated_at, source "
+            "FROM project_variables "
             "WHERE project_id = ? ORDER BY scope, name",
             (project_id,),
         )
     return [Variable(*r) for r in rows]
+
+
+def unset_auto_all(
+    conn: Connection,
+    project_id: int,
+) -> int:
+    """Delete every auto row for the project. Manual rows untouched.
+
+    Backs ``knowledge vars unset --auto``. The next ``build``/``update``
+    will re-populate from the on-disk YAML files (if any).
+    """
+    return db.execute(
+        conn,
+        "DELETE FROM project_variables "
+        "WHERE project_id = ? AND source LIKE 'auto:%'",
+        (project_id,),
+    )
 
 
 def import_json(

@@ -358,11 +358,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_v_unset = p_v_sub.add_parser(
         "unset",
-        help="Remove a variable (or --all to clear a whole scope).",
+        help="Remove a variable (or --all to clear a scope, --auto to clear "
+             "auto-loaded rows).",
     )
     p_v_unset.add_argument(
         "scope",
+        nargs="?",
         choices=sorted(("ansible", "terraform", "helm", "all")),
+        help="Domain to operate on (required unless --auto is used).",
     )
     p_v_unset.add_argument("name", nargs="?", help="Variable name (omit with --all)")
     p_v_unset.add_argument(
@@ -370,6 +373,13 @@ def main(argv: list[str] | None = None) -> int:
         dest="unset_all",
         action="store_true",
         help="Clear every variable in the given scope",
+    )
+    p_v_unset.add_argument(
+        "--auto",
+        dest="unset_auto",
+        action="store_true",
+        help="Clear every auto-loaded variable (group_vars/host_vars). "
+             "Manual rows are kept. Scope argument is ignored.",
     )
     p_v_unset.add_argument("--project", help="Scope to a specific project (name or abs path)")
 
@@ -2690,19 +2700,43 @@ def _cmd_vars_set(args: argparse.Namespace) -> int:
 def _cmd_vars_unset(args: argparse.Namespace) -> int:
     from . import variables
 
-    if not args.unset_all and not args.name:
-        print(
-            "error: give a variable name, or pass --all to clear the whole scope.",
-            file=sys.stderr,
-        )
-        return 1
+    if args.unset_auto:
+        # --auto is mutually exclusive with name/scope/all — it clears
+        # every auto-loaded row regardless of scope.
+        if args.unset_all or args.name or args.scope:
+            print(
+                "error: --auto clears all auto-loaded rows; do not pass "
+                "scope/name/--all with it.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        if not args.scope:
+            print(
+                "error: scope is required (ansible|terraform|helm|all) "
+                "unless --auto is used.",
+                file=sys.stderr,
+            )
+            return 1
+        if not args.unset_all and not args.name:
+            print(
+                "error: give a variable name, or pass --all to clear the "
+                "whole scope.",
+                file=sys.stderr,
+            )
+            return 1
 
     with db.connect() as conn:
         proj = _resolve_project_or_error(conn, args.project)
         if proj is None:
             return 1
         try:
-            if args.unset_all:
+            if args.unset_auto:
+                removed = variables.unset_auto_all(conn, proj.id)
+                print(
+                    f"cleared {removed} auto-loaded variable(s) for {proj.name}"
+                )
+            elif args.unset_all:
                 removed = variables.unset_scope(conn, proj.id, args.scope)
                 print(
                     f"cleared {removed} variable(s) from scope '{args.scope}' "
@@ -2750,6 +2784,7 @@ def _cmd_vars_list(args: argparse.Namespace) -> int:
                         "name": v.name,
                         "value": v.value,
                         "updated_at": v.updated_at,
+                        "source": v.source,
                     }
                     for v in rows
                 ],
@@ -2765,7 +2800,8 @@ def _cmd_vars_list(args: argparse.Namespace) -> int:
         return 0
     print(f"{proj.name}:")
     for v in rows:
-        print(f"  [{v.scope:<9}] {v.name:<24} = {v.value}")
+        suffix = "" if v.source == "manual" else f"  ({v.source})"
+        print(f"  [{v.scope:<9}] {v.name:<24} = {v.value}{suffix}")
     return 0
 
 

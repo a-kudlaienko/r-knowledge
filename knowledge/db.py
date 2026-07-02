@@ -17,6 +17,7 @@ than silently migrating — better UX for a local tool).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Iterable
 
 import apsw
 import sqlite_vec
@@ -191,6 +192,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         scope       TEXT    NOT NULL,
         name        TEXT    NOT NULL,
         value       TEXT    NOT NULL,
+        source      TEXT    NOT NULL DEFAULT 'manual',
         created_at  REAL    NOT NULL,
         updated_at  REAL    NOT NULL,
         UNIQUE(project_id, scope, name)
@@ -357,6 +359,17 @@ def init_schema(conn: Connection) -> None:
     ):
         if col not in have_cols:
             conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
+
+    # Additive backfill for project_variables.source. Distinguishes manual
+    # `vars set` rows from auto-loaded ones (group_vars/host_vars). Default
+    # 'manual' keeps every pre-existing row's behavior intact.
+    have_cols = {row[1] for row in conn.execute(
+        "PRAGMA table_info(project_variables)")}
+    if "source" not in have_cols:
+        conn.execute(
+            "ALTER TABLE project_variables "
+            "ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+        )
 
     # Seed versions on first run. APSW auto-commits outside of explicit
     # transaction blocks, so these INSERTs are durable immediately.
@@ -591,6 +604,343 @@ def insert_chunk_embedding(conn, chunk_id: int, vec) -> None:
     )
 
 
+def insert_chunk_embeddings_bulk(conn, rows: Iterable[tuple[int, Any]]) -> int:
+    """Bulk-insert ``(chunk_id, embedding)`` pairs. Returns row count.
+
+    PostgreSQL: a single ``COPY chunk_embeddings FROM STDIN`` — vectors go
+    over the wire as pgvector's text literal ``[v1,v2,...]``. One round-trip
+    for the whole batch instead of N; on remote / LB-fronted PG this is the
+    difference between a multi-minute hang and a few seconds. Rows are
+    streamed from the iterator so RAM stays bounded on huge builds.
+
+    SQLite: falls back to the existing single-row insert into ``chunks_vec``.
+    APSW ``executemany`` against a vec0 virtual table isn't exercised
+    anywhere in this codebase, and the SQLite path is always local — the
+    round-trip cost the COPY path solves does not apply.
+    """
+
+    if current_mode() == "postgresql":
+        n = 0
+        with conn.cursor() as cur:
+            with cur.copy(
+                "COPY chunk_embeddings(chunk_id, embedding) FROM STDIN"
+            ) as copy:
+                for chunk_id, vec in rows:
+                    # ``.tolist()`` upcasts numpy float32 to Python float;
+                    # ``str()`` on a float preserves full repr precision.
+                    vec_str = "[" + ",".join(str(v) for v in vec.tolist()) + "]"
+                    copy.write_row((chunk_id, vec_str))
+                    n += 1
+        return n
+    n = 0
+    for chunk_id, vec in rows:
+        conn.execute(
+            "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, ?)",
+            (chunk_id, vec.tobytes()),
+        )
+        n += 1
+    return n
+
+
+def reserve_ids(conn, table: str, n: int) -> list[int]:
+    """Pre-allocate ``n`` ids for ``table`` in ONE round-trip.
+
+    PostgreSQL: pulls ``n`` values from the table's ``id`` sequence via a
+    single ``generate_series`` call. This lets the indexer resolve foreign keys
+    (``chunks.file_id``, self-referential ``chunks.parent_id``) client-side
+    and then stream every row through one COPY — instead of N
+    ``INSERT ... RETURNING id`` round-trips (each a full LB/WAN latency hop
+    on remote PG). The number of round-trips becomes independent of how many
+    rows the repo has.
+
+    ``table`` is interpolated into ``pg_get_serial_sequence`` (never a user
+    value — only literals ``'chunks'`` / ``'files'`` from the indexer) so the
+    real sequence name is resolved rather than hard-coded. Returns the ids in
+    allocation order; ``n <= 0`` returns ``[]`` with no round-trip.
+
+    SQLite: reads ``SELECT COALESCE(MAX(id), 0) FROM <table>`` and returns
+    ``[max+1 .. max+n]``. Safe under the single-writer transaction guarantee
+    (no concurrent writers can bump the max between the read and the
+    subsequent batch INSERT).
+    """
+
+    if n <= 0:
+        return []
+    if table not in ("chunks", "files"):
+        raise ValueError(
+            f"reserve_ids: unsupported table {table!r}; expected 'chunks' or 'files'"
+        )
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT nextval(pg_get_serial_sequence(%s, 'id')) "
+                "FROM generate_series(1, %s)",
+                (table, n),
+            )
+            return [int(r[0]) for r in cur.fetchall()]
+    base = conn.execute(
+        f"SELECT COALESCE(MAX(id), 0) FROM {table}"
+    ).fetchone()[0]
+    return list(range(base + 1, base + n + 1))
+
+
+def copy_file_rows(conn, rows: Iterable[tuple]) -> int:
+    """Bulk-insert fully-formed file rows.
+
+    Columns in this exact order (ids come from :func:`reserve_ids`)::
+
+        id, project_id, rel_path, content_hash, mtime, size, lang, last_scanned
+
+    PostgreSQL: one ``COPY files(...) FROM STDIN`` — a single round-trip.
+    SQLite: ``executemany`` INSERT with explicit ids.
+
+    Returns the row count.
+    """
+
+    rows = list(rows)
+    if not rows:
+        return 0
+    if current_mode() == "postgresql":
+        n = 0
+        with conn.cursor() as cur:
+            with cur.copy(
+                "COPY files(id, project_id, rel_path, content_hash, mtime, "
+                "size, lang, last_scanned) FROM STDIN"
+            ) as copy:
+                for row in rows:
+                    copy.write_row(row)
+                    n += 1
+        return n
+    conn.executemany(
+        "INSERT INTO files("
+        "id, project_id, rel_path, content_hash, mtime, size, lang, last_scanned"
+        ") VALUES (?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
+def copy_chunk_rows(conn, rows: Iterable[tuple]) -> int:
+    """Bulk-insert fully-formed chunk rows.
+
+    Each row MUST supply columns in this exact order — parents ahead of
+    children, since the self-referential ``parent_id`` FK is NOT DEFERRABLE
+    and is checked as each row lands::
+
+        id, project_id, file_id, parent_id, sibling_order, kind, name,
+        qualified_name, start_line, end_line, start_byte, end_byte,
+        char_count, content_hash, stored_text, embedded_text, metadata
+
+    PostgreSQL: one ``COPY chunks(...) FROM STDIN`` — ``search_vector`` is a
+    GENERATED column and is intentionally omitted.
+    SQLite: ``executemany`` INSERT with explicit ids. FTS5 ``chunks_fts`` is
+    maintained by ``AFTER INSERT`` triggers on ``chunks`` which fire per-row
+    under ``executemany`` automatically — no special handling needed.
+
+    Returns the row count; ids come from :func:`reserve_ids`.
+    """
+
+    rows = list(rows)
+    if not rows:
+        return 0
+    if current_mode() == "postgresql":
+        n = 0
+        with conn.cursor() as cur:
+            with cur.copy(
+                "COPY chunks(id, project_id, file_id, parent_id, sibling_order, "
+                "kind, name, qualified_name, start_line, end_line, start_byte, "
+                "end_byte, char_count, content_hash, stored_text, embedded_text, "
+                "metadata) FROM STDIN"
+            ) as copy:
+                for row in rows:
+                    copy.write_row(row)
+                    n += 1
+        return n
+    conn.executemany(
+        "INSERT INTO chunks("
+        "id, project_id, file_id, parent_id, sibling_order, kind, name, "
+        "qualified_name, start_line, end_line, start_byte, end_byte, "
+        "char_count, content_hash, stored_text, embedded_text, metadata"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
+def bulk_touch_files(conn, rows: Iterable[tuple[int, float, float]]) -> None:
+    """Sync ``(mtime, last_scanned)`` for a batch of unchanged files.
+
+    ``rows`` = ``[(file_id, mtime, last_scanned), ...]``. On an incremental
+    ``update`` most files are byte-identical but their disk mtime may have
+    moved (``git checkout``, editors, ``touch``); we refresh it so ``status``
+    doesn't flag them stale forever.
+
+    PostgreSQL: ONE ``UPDATE ... FROM (VALUES ...)`` — a single round-trip for
+    the whole repo, instead of one per unchanged file (the difference between
+    ~1 s and ~1 min on a remote/LB-fronted DB). SQLite: per-row UPDATE, as
+    before — local, nothing to batch.
+    """
+
+    rows = list(rows)
+    if not rows:
+        return
+    if current_mode() == "postgresql":
+        # Column types are taken from the first VALUES row, so cast it; the
+        # rest ride along. Flatten to positional params in row order.
+        first = "(%s::bigint, %s::double precision, %s::double precision)"
+        rest = "(%s, %s, %s)"
+        values_sql = ",".join([first] + [rest] * (len(rows) - 1))
+        params: list = []
+        for fid, mtime, last_scanned in rows:
+            params.extend((fid, mtime, last_scanned))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE files AS f SET mtime = v.mtime, last_scanned = v.ls "
+                f"FROM (VALUES {values_sql}) AS v(id, mtime, ls) "
+                f"WHERE f.id = v.id",
+                params,
+            )
+        return
+    for fid, mtime, last_scanned in rows:
+        conn.execute(
+            "UPDATE files SET mtime = ?, last_scanned = ? WHERE id = ?",
+            (mtime, last_scanned, fid),
+        )
+
+
+def bulk_update_chunk_positions(conn, rows: Iterable[tuple]) -> None:
+    """Refresh positional / parent fields for many REUSED chunks in one call.
+
+    Each row supplies, in this exact order:
+        (id, parent_id, sibling_order, start_line, end_line, start_byte,
+         end_byte, name, qualified_name, metadata)
+
+    content_hash / stored_text / embedded_text / char_count / kind are NOT
+    touched (reused chunks matched by content_hash, so those are unchanged).
+
+    PostgreSQL: ONE ``UPDATE chunks AS c SET ... FROM (VALUES ...) AS v(...)
+    WHERE c.id = v.id`` — one round-trip for the whole batch.
+    SQLite: ``executemany`` UPDATE; id LAST to match the WHERE clause.
+    """
+
+    rows = list(rows)
+    if not rows:
+        return
+    if current_mode() == "postgresql":
+        # Column types are taken from the first VALUES row, so cast it; the
+        # rest ride along. Flatten to positional params in row order.
+        first = (
+            "(%s::bigint, %s::bigint, %s::integer, %s::integer, %s::integer, "
+            "%s::integer, %s::integer, %s::text, %s::text, %s::text)"
+        )
+        rest = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+        values_sql = ",".join([first] + [rest] * (len(rows) - 1))
+        params: list = []
+        for row in rows:
+            params.extend(row)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE chunks AS c SET "
+                f"parent_id = v.parent_id, "
+                f"sibling_order = v.sibling_order, "
+                f"start_line = v.start_line, "
+                f"end_line = v.end_line, "
+                f"start_byte = v.start_byte, "
+                f"end_byte = v.end_byte, "
+                f"name = v.name, "
+                f"qualified_name = v.qualified_name, "
+                f"metadata = v.metadata "
+                f"FROM (VALUES {values_sql}) AS v("
+                f"id, parent_id, sibling_order, start_line, end_line, "
+                f"start_byte, end_byte, name, qualified_name, metadata) "
+                f"WHERE c.id = v.id",
+                params,
+            )
+        return
+    # SQLite: id comes LAST in the WHERE clause, so reorder per row.
+    conn.executemany(
+        "UPDATE chunks SET "
+        "parent_id=?, sibling_order=?, start_line=?, end_line=?, "
+        "start_byte=?, end_byte=?, name=?, qualified_name=?, metadata=? "
+        "WHERE id=?",
+        [
+            (r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0])
+            for r in rows
+        ],
+    )
+
+
+def copy_file_edge_rows(conn, rows: Iterable[tuple]) -> int:
+    """Bulk-insert ``file_edges`` rows without specifying ``id``.
+
+    ``rows`` must be in this exact column order (engine assigns ``id``)::
+
+        (project_id, source_file_id, target_file_id, kind, raw, symbol, line)
+
+    PostgreSQL: one ``COPY file_edges(...) FROM STDIN`` — a single
+    round-trip for all edges regardless of count.
+
+    SQLite: ``executemany`` INSERT — one Python→C batch call.
+
+    Returns the row count.
+    """
+    rows = list(rows)
+    if not rows:
+        return 0
+    if current_mode() == "postgresql":
+        n = 0
+        with conn.cursor() as cur:
+            with cur.copy(
+                "COPY file_edges("
+                "project_id, source_file_id, target_file_id, "
+                "kind, raw, symbol, line"
+                ") FROM STDIN"
+            ) as copy:
+                for row in rows:
+                    copy.write_row(row)
+                    n += 1
+        return n
+    conn.executemany(
+        "INSERT INTO file_edges("
+        "project_id, source_file_id, target_file_id, kind, raw, symbol, line"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    return len(rows)
+
+
+def wipe_file_edges(conn, source_file_ids) -> None:
+    """Delete all edges whose ``source_file_id`` is in ``source_file_ids``.
+
+    PostgreSQL: one ``DELETE ... WHERE source_file_id = ANY(%s)`` — a
+    single round-trip for the whole batch.
+
+    SQLite: ``DELETE ... WHERE source_file_id IN (?,...)`` chunked into
+    groups of ≤ 900 ids to stay well under ``SQLITE_MAX_VARIABLE_NUMBER``.
+
+    No-op when ``source_file_ids`` is empty.
+    """
+    ids = list(source_file_ids)
+    if not ids:
+        return
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM file_edges WHERE source_file_id = ANY(%s)",
+                (ids,),
+            )
+        return
+    # SQLite: chunk to stay under the variable-number limit.
+    chunk_size = 900
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM file_edges WHERE source_file_id IN ({placeholders})",
+            chunk,
+        )
+
+
 def delete_chunk_embeddings_for_project(conn, project_id: int) -> None:
     """Wipe vector rows for a project before a full rebuild.
 
@@ -627,6 +977,122 @@ def delete_chunk_embeddings_by_ids(conn, chunk_ids: list[int]) -> None:
         f"DELETE FROM chunks_vec WHERE chunk_id IN ({placeholders})",
         chunk_ids,
     )
+
+
+def bulk_update_file_rows(conn, rows: Iterable[tuple]) -> None:
+    """Refresh ``content_hash / mtime / size / last_scanned`` for changed files.
+
+    Each row supplies, in this exact order:
+        (id, content_hash, mtime, size, last_scanned)
+
+    PostgreSQL: ONE ``UPDATE files AS f SET ... FROM (VALUES ...) AS v(...)
+    WHERE f.id = v.id`` — mirrors :func:`bulk_touch_files` exactly.
+    First VALUES row is cast to resolve types; the rest ride along.
+    SQLite: ``executemany`` UPDATE; id LAST for the WHERE clause.
+    """
+
+    rows = list(rows)
+    if not rows:
+        return
+    if current_mode() == "postgresql":
+        first = (
+            "(%s::bigint, %s::text, %s::double precision, "
+            "%s::bigint, %s::double precision)"
+        )
+        rest = "(%s,%s,%s,%s,%s)"
+        values_sql = ",".join([first] + [rest] * (len(rows) - 1))
+        params: list = []
+        for row in rows:
+            params.extend(row)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE files AS f SET "
+                f"content_hash = v.content_hash, "
+                f"mtime = v.mtime, "
+                f"size = v.size, "
+                f"last_scanned = v.last_scanned "
+                f"FROM (VALUES {values_sql}) "
+                f"AS v(id, content_hash, mtime, size, last_scanned) "
+                f"WHERE f.id = v.id",
+                params,
+            )
+        return
+    # SQLite: id LAST in WHERE clause.
+    conn.executemany(
+        "UPDATE files SET content_hash=?, mtime=?, size=?, last_scanned=? WHERE id=?",
+        [(r[1], r[2], r[3], r[4], r[0]) for r in rows],
+    )
+
+
+def delete_chunks_by_ids(conn, chunk_ids) -> None:
+    """Delete chunks (and their embeddings) by id list.
+
+    PostgreSQL: one ``DELETE FROM chunks WHERE id = ANY(%s)`` — FK ON DELETE
+    CASCADE sweeps ``chunk_embeddings`` automatically.
+    SQLite: first explicitly sweeps ``chunks_vec`` (no FK cascade on the vec0
+    virtual table), then deletes from ``chunks`` in batches of ≤ 900 ids to
+    stay under ``SQLITE_MAX_VARIABLE_NUMBER``.
+
+    No-op when ``chunk_ids`` is empty.
+    """
+
+    chunk_ids = list(chunk_ids)
+    if not chunk_ids:
+        return
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE id = ANY(%s)",
+                (chunk_ids,),
+            )
+        return
+    # SQLite: sweep vec0 first (no FK cascade), then delete chunks in chunks.
+    delete_chunk_embeddings_by_ids(conn, chunk_ids)
+    chunk_size = 900
+    for i in range(0, len(chunk_ids), chunk_size):
+        chunk = chunk_ids[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM chunks WHERE id IN ({placeholders})",
+            chunk,
+        )
+
+
+def fetch_chunks_for_files(conn, file_ids) -> list[tuple]:
+    """Return ``(file_id, id, content_hash)`` rows for the given files.
+
+    PostgreSQL: one ``SELECT ... WHERE file_id = ANY(%s)`` — single
+    round-trip.
+    SQLite: ``SELECT ... WHERE file_id IN (...)`` chunked into groups of
+    ≤ 900 ids to stay under ``SQLITE_MAX_VARIABLE_NUMBER``; results are
+    concatenated and returned.
+
+    Returns ``[]`` when ``file_ids`` is empty.
+    """
+
+    file_ids = list(file_ids)
+    if not file_ids:
+        return []
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_id, id, content_hash FROM chunks WHERE file_id = ANY(%s)",
+                (file_ids,),
+            )
+            return cur.fetchall()
+    result: list[tuple] = []
+    chunk_size = 900
+    for i in range(0, len(file_ids), chunk_size):
+        chunk = file_ids[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        result.extend(
+            conn.execute(
+                f"SELECT file_id, id, content_hash FROM chunks "
+                f"WHERE file_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        )
+    return result
 
 
 def insert_history_embedding(conn, history_id: int, vec) -> None:

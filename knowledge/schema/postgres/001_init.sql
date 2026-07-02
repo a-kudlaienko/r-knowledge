@@ -157,10 +157,13 @@ CREATE TABLE IF NOT EXISTS project_variables (
     scope       TEXT      NOT NULL,
     name        TEXT      NOT NULL,
     value       TEXT      NOT NULL,
+    source      TEXT      NOT NULL DEFAULT 'manual',
     created_at  DOUBLE PRECISION NOT NULL,
     updated_at  DOUBLE PRECISION NOT NULL,
     UNIQUE (project_id, scope, name)
 );
+ALTER TABLE project_variables
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
 CREATE INDEX IF NOT EXISTS idx_project_variables
     ON project_variables(project_id, scope);
 

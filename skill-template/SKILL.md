@@ -441,9 +441,14 @@ knowledge vars import ansible /path/to/vars.json                      # bulk fro
 knowledge vars list [--scope ansible] [--json]
 knowledge vars unset ansible deploy_env                               # remove one
 knowledge vars unset ansible --all                                    # clear a scope
+knowledge vars unset --auto                                           # clear auto-loaded rows
 ```
 
-Every mutation auto-applies against the existing graph — no rebuild needed. Scope routing:
+Every mutation auto-applies against the existing graph — no rebuild needed.
+
+**Ansible auto-load.** `build`/`update` reads `group_vars/all*` and `host_vars/*` (project root, every `ansible.cfg` dir, every `inventory =` dir) into `scope='ansible'` automatically. Precedence per Ansible docs: inventory `group_vars/all` < playbook `group_vars/all` < inventory `host_vars/*` < playbook `host_vars/*`. Manual `vars set` rows always beat auto rows. `vars list` tags auto rows with `(auto:group_vars)` / `(auto:host_vars)`.
+
+Scope routing:
 
 | Edge kind | Syntax | Scope lookup order |
 |---|---|---|
