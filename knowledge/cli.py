@@ -202,6 +202,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_resume.add_argument("--project", help="Scope to a specific project (name or abs path)")
 
+    # consolidate — recurring-theme gap report (read-only).
+    p_consol = sub.add_parser(
+        "consolidate",
+        help="Surface recurring history themes not yet recorded as decisions (read-only).",
+    )
+    p_consol.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_consol.add_argument("--days", type=int, default=90,
+                          help="History window in days (default: 90)")
+    p_consol.add_argument("--limit", type=int, default=100,
+                          help="Max history entries to scan (default: 100)")
+    p_consol.add_argument("--similarity", type=float, default=0.55,
+                          help="Cluster similarity threshold (default: 0.55)")
+    p_consol.add_argument("--covered", type=float, default=0.68,
+                          help="Coverage threshold against decisions (default: 0.68)")
+    p_consol.add_argument("--min-cluster", type=int, default=2, dest="min_cluster",
+                          help="Minimum cluster size (default: 2)")
+    p_consol.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+    )
+
     # get
     p_get = sub.add_parser("get", help="Fetch a chunk by id")
     p_get.add_argument("chunk_id", type=int)
@@ -1246,6 +1268,135 @@ def _print_resume(rb) -> None:
         "  - use `knowledge why <path>` to understand one file\n"
         "  - log non-obvious choices with `knowledge decide <topic> --decision <...>`"
     )
+
+
+def cmd_consolidate(args: argparse.Namespace) -> int:
+    """Recurring-theme gap report — read-only consolidation of history vs decisions."""
+    import json as json_mod
+    from . import consolidate as consolidate_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+        report = consolidate_mod.build(
+            conn,
+            project_id=proj.id,
+            project_name=proj.name,
+            project_root=str(proj.root_path),
+            days=args.days,
+            limit=args.limit,
+            sim_threshold=args.similarity,
+            covered_threshold=args.covered,
+            min_size=args.min_cluster,
+        )
+
+    if args.format == "json":
+        def _serialise(report) -> dict:
+            return {
+                "project_name": report.project_name,
+                "project_root": report.project_root,
+                "scanned_history_n": report.scanned_history_n,
+                "total_decisions": report.total_decisions,
+                "covered_skipped_n": report.covered_skipped_n,
+                "singletons_n": report.singletons_n,
+                "candidates": [
+                    {
+                        "suggested_topic": c.suggested_topic,
+                        "entry_ids": [e.id for e in c.entries],
+                        "entry_shorts": [e.short_summary for e in c.entries],
+                        "files": c.files,
+                        "nearest_decision_id": (
+                            c.nearest_decision.id if c.nearest_decision else None
+                        ),
+                        "nearest_sim": round(c.nearest_sim, 4),
+                        "cohesion": round(c.cohesion, 4),
+                    }
+                    for c in report.candidates
+                ],
+            }
+        print(json_mod.dumps(_serialise(report), indent=2))
+    else:
+        _print_consolidate(report, covered_threshold=args.covered)
+    return 0
+
+
+def _print_consolidate(report, covered_threshold: float = 0.68) -> None:
+    """Plain-text consolidation report."""
+    from datetime import datetime
+
+    print(f"{report.project_name}  ({report.project_root})")
+    print(
+        f"scanned {report.scanned_history_n} history · "
+        f"{report.total_decisions} decisions · "
+        f"{len(report.candidates)} candidate theme(s)  "
+        f"({report.covered_skipped_n} covered, {report.singletons_n} one-off)"
+    )
+    print(
+        "# candidates below are NOT recorded"
+        " — review and run `knowledge decide` yourself"
+    )
+
+    # ---- empty states ----
+    if report.scanned_history_n < 2:
+        print("(not enough history yet)")
+        return
+
+    total_clusters = len(report.candidates) + report.covered_skipped_n
+    if total_clusters == 0:
+        print(
+            f"(no recurring themes — all {report.scanned_history_n} entries are"
+            " unique by similarity; try --similarity 0.45 to widen)"
+        )
+        return
+
+    if not report.candidates and report.covered_skipped_n > 0:
+        print(
+            f"(all {report.covered_skipped_n} recurring theme(s) already covered"
+            " by existing decisions)"
+        )
+        return
+
+    # ---- per-candidate output ----
+    for k, c in enumerate(report.candidates, start=1):
+        notes = []
+        if c.has_near_dupes:
+            notes.append("near-duplicate entries")
+        if c.truncated:
+            notes.append("truncated")
+        note_str = f"  ({', '.join(notes)})" if notes else ""
+
+        print(f"\n# theme {k} — \"{c.suggested_topic}\"  ({len(c.entries)} entries){note_str}")
+
+        # Nearest decision line.
+        if c.nearest_decision:
+            d = c.nearest_decision
+            print(
+                f"  closest decision: #{d.id} \"{d.topic}\""
+                f" sim={c.nearest_sim:.2f}"
+                f" (< {covered_threshold} → not covered)"
+            )
+        else:
+            print("  no existing decisions")
+
+        # Entries.
+        print("  entries:")
+        for e in c.entries:
+            date_s = datetime.fromtimestamp(e.created_at).strftime("%Y-%m-%d")
+            print(f"    id={e.id} {date_s}  {e.short_summary}")
+
+        # Files.
+        if c.files:
+            print(f"  files: {', '.join(c.files)}")
+
+        # Scaffold.
+        files_arg = (
+            " --files " + " ".join(c.files) if c.files else ""
+        )
+        print(
+            f"  → consider: knowledge decide \"{c.suggested_topic}\""
+            f" --decision \"<FILL IN>\"{files_arg}"
+        )
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
@@ -3173,6 +3324,7 @@ _DISPATCH = {
     "decide": cmd_decide,
     "decisions": cmd_decisions,
     "resume": cmd_resume,
+    "consolidate": cmd_consolidate,
     "get": cmd_get,
     "path": cmd_path,
     "projects": cmd_projects,

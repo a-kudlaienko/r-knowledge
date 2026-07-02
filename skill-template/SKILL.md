@@ -313,6 +313,7 @@ User: "how does the karmada cert regeneration ansible task work"
 Two complementary stores:
 - **History** (`knowledge history stage|ingest|recent|search`) — free-form work summaries keyed by session/time. Good for "what did we do last Tuesday."
 - **Decisions** (`knowledge decide|decisions|resume`) — structured choices with topic/decision/rationale/files. Good for "why did we pick X over Y."
+- **Consolidate** (`knowledge consolidate`) — read-only report of recurring `history` themes not yet captured as a `decision`. Run periodically (end of a work stretch, or every few weeks) or when `resume` shows many history entries but few decisions. It never writes — review the candidates and record the real ones with `decide`.
 
 Use **history** for narrative, **decisions** for commitments. `resume` aggregates both plus git and staging state into one session-start brief.
 

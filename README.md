@@ -148,7 +148,7 @@ knowledge ask "how does X work?"
 | 🎯 **Find** | `knowledge find <symbol>` · `grep '<pattern>'` | Exact symbol / full-text lookup (no embedder) |
 | 🧭 **Orient** | `knowledge why <file>` · `map` · `brief` | Understand a file or tree before reading it |
 | 🕸️ **Graph** | `knowledge relations <file>` · `graph` | Imports, callers, blast radius |
-| 🧠 **Remember** | `knowledge resume` · `decide` · `history` | Decisions + work log across sessions |
+| 🧠 **Remember** | `knowledge resume` · `decide` · `history` · `consolidate` | Decisions + work log across sessions |
 | 🔄 **Maintain** | `knowledge update` · `status --json` | Keep the index fresh (`missing`/`stale`/`fresh`) |
 
 > 💡 **Sharpen retrieval** by prefixing queries with a *kind hint*: `python function:`, `terraform resource:`, `ansible task:`, `helm template:`, `docs:`. → [full table in Details ↓](#-details)
@@ -322,9 +322,13 @@ knowledge history stage --short "Fixed project-name resolution." --long "…" --
 knowledge history ingest
 knowledge history recent --limit 10
 knowledge history search "auth middleware"
+
+knowledge consolidate     # read-only audit: recurring history themes not yet recorded as a decision
 ```
 
 Every decision is stamped with its author (git identity, UNIX-login fallback). Overriding an existing decision needs `--supersede <id> --override-reason "<why>"` — the tool blocks until you justify it, so in shared mode teammates relying on the old behavior aren't silently overruled.
+
+**Consolidate** (`knowledge consolidate`) is a **read-only** audit that closes the gap between the two stores: it semantically clusters recurring `history` themes and flags any *not yet captured as a `decision`*, printing a ready-to-fill `decide` scaffold for each. It never writes — you review the candidates and record the real ones. Themes already covered by an existing decision are skipped, so a clean run means your decision log is keeping pace with your work. Scans the last 90 days by default (`--days`); tune `--similarity` / `--covered` to widen or tighten.
 
 Use `ask` for code questions, not history search.
 
