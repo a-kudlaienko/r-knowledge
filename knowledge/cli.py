@@ -194,6 +194,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("text", "json"),
         default="text",
     )
+    p_decs.add_argument(
+        "--full",
+        action="store_true",
+        help="Print untruncated decision/why text (default: compact, ~200/120 char truncation).",
+    )
 
     # resume — opinionated session-start brief.
     p_resume = sub.add_parser(
@@ -475,14 +480,18 @@ def main(argv: list[str] | None = None) -> int:
     # install-skill
     p_install = sub.add_parser(
         "install-skill",
-        help="Wire the knowledge skill into one or more IDEs (Claude/Cursor/Codex/OpenCode)",
+        help="Wire the knowledge skill into one or more IDEs (Claude/Cursor/Codex/OpenCode/Gemini)",
     )
     p_install.add_argument(
         "--ide",
         default="claude",
         help=(
-            "Comma-separated target IDEs: claude,cursor,codex,opencode (or 'all'). "
-            "Default: claude — .claude/skills/knowledge/SKILL.md"
+            "Comma-separated target IDEs: claude,cursor,codex,opencode,gemini "
+            "(or 'all' for all five). Default: claude — "
+            ".claude/skills/knowledge/SKILL.md. codex/opencode/gemini get the "
+            "COMPACT AGENTS-style render (see `knowledge skill show` for the "
+            "full guide); cursor's .mdc stays full (agent-requested, not "
+            "always-on)."
         ),
     )
     p_install.add_argument(
@@ -504,6 +513,19 @@ def main(argv: list[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="Overwrite an existing dedicated skill file (SKILL.md / .mdc) at the target",
+    )
+
+    # skill — progressive-disclosure escape hatch: the compact AGENTS.md /
+    # GEMINI.md renders end with "Full guide: run `knowledge skill show`" so
+    # any IDE stuck with the compact form can pull the complete guide on demand.
+    p_skill = sub.add_parser(
+        "skill",
+        help="Inspect the canonical knowledge skill content",
+    )
+    p_skill_sub = p_skill.add_subparsers(dest="skill_cmd", required=True)
+    p_skill_sub.add_parser(
+        "show",
+        help="Print the full canonical skill body (frontmatter stripped)",
     )
 
     # config — runtime settings (storage mode, PG DSN status). Phase 0 of
@@ -1173,7 +1195,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             default=str,
         ))
     else:
-        _print_decisions(entries)
+        _print_decisions(entries, full=args.full)
     return 0
 
 
@@ -1195,22 +1217,70 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_decisions(entries) -> None:
-    """Pretty-print (Decision, distance|None) tuples."""
+def _truncate_words(text, limit: int) -> str:
+    """Cut ``text`` at the last word boundary at-or-before ``limit`` chars.
+
+    Appends '…' only when truncation actually happened. Text at or under the
+    limit is returned unchanged. ``None``/empty input passes through as-is.
+    """
+    if not text:
+        return text
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    last_space = cut.rfind(" ")
+    if last_space > 0:
+        cut = cut[:last_space]
+    return cut.rstrip() + "…"
+
+
+def _short_author(author):
+    """Drop the '<email>' portion of a 'Name <email>' author string.
+
+    Leaves bare emails (no name part) or plain names/logins untouched —
+    there is nothing shorter to fall back to in those cases.
+    """
+    if not author:
+        return author
+    import re
+
+    m = re.match(r"^(.+?)\s*<[^>]*>$", author)
+    if m and m.group(1):
+        return m.group(1)
+    return author
+
+
+def _print_decisions(entries, full: bool = False) -> None:
+    """Pretty-print (Decision, distance|None) tuples.
+
+    Compact by default (~200-char decision / ~120-char why, short author) to
+    keep the mandated pre-change conflict check cheap for LLM agents; pass
+    ``full=True`` (CLI: --full) for the verbatim text and full author string.
+    """
     from datetime import datetime
 
     if not entries:
         print("(no decisions)")
         return
-    for d, dist in entries:
+    for i, (d, dist) in enumerate(entries):
+        if full:
+            author_s = d.author
+            decision_s = d.decision
+            rationale_s = d.rationale
+        else:
+            if i > 0:
+                print()
+            author_s = _short_author(d.author)
+            decision_s = _truncate_words(d.decision, 200)
+            rationale_s = _truncate_words(d.rationale, 120)
         when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d %H:%M")
         dist_s = f"  dist={dist:.3f}" if dist is not None else ""
-        by = f"  by {d.author}" if d.author else ""
+        by = f"  by {author_s}" if author_s else ""
         print(f"{when}  id={d.id}{by}{dist_s}")
         print(f"  topic:    {d.topic}")
-        print(f"  decision: {d.decision}")
-        if d.rationale:
-            print(f"  why:      {d.rationale}")
+        print(f"  decision: {decision_s}")
+        if rationale_s:
+            print(f"  why:      {rationale_s}")
         if d.supersedes:
             ovr = f" — {d.override_reason}" if d.override_reason else ""
             print(f"  overrides: id={d.supersedes}{ovr}")
@@ -1407,6 +1477,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         proj = _resolve_project_or_error(conn, args.project)
         if proj is None:
             return 1
+        # Cross-client cache-invalidation signal — no extra DB query, proj
+        # is already fetched. See knowledge/query_cache.py module docstring.
+        index_stamp = max(proj.last_build or 0, proj.last_update or 0)
         results = hybrid_search.ask(
             conn,
             query=args.question,
@@ -1416,6 +1489,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             lang=args.lang,
             top_k=args.top_k,
             use_cache=not args.no_cache,
+            index_stamp=index_stamp,
         )
 
     kept, omitted = hybrid_search.truncate_to_budget(results, args.budget)
@@ -1928,8 +2002,9 @@ _AGENTS_BLOCK_END = "<!-- END knowledge skill -->"
 
 # Per-IDE install matrix. `dest` is relative to the cwd repo (project scope) or
 # to $HOME (user scope). `dedicated` files are ours alone (copy/symlink, --force
-# to overwrite); non-dedicated files (AGENTS.md) are merged via a managed block
-# because users commonly keep their own content there.
+# to overwrite); non-dedicated files (AGENTS.md / GEMINI.md) are merged via a
+# managed block because users commonly keep their own content there — no
+# --force needed, re-installs just replace the block in place.
 _IDE_TARGETS = {
     "claude": {
         "sibling": "SKILL.md",
@@ -1953,6 +2028,15 @@ _IDE_TARGETS = {
         "sibling": "AGENTS.md",
         "project_dest": Path("AGENTS.md"),
         "user_dest": Path(".config/opencode/AGENTS.md"),
+        "dedicated": False,
+    },
+    "gemini": {
+        # Same generated sibling as codex/opencode (compact render) — gemini-cli
+        # just reads it from a differently-named file. Its own `contextFileName`
+        # setting can alternatively be pointed at AGENTS.md directly.
+        "sibling": "AGENTS.md",
+        "project_dest": Path("GEMINI.md"),
+        "user_dest": Path(".gemini/GEMINI.md"),
         "dedicated": False,
     },
 }
@@ -2105,6 +2189,36 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
         )
         print("  knowledge config check-env")
     return rc
+
+
+def cmd_skill_show(args: argparse.Namespace) -> int:
+    """Print the full canonical skill body (frontmatter stripped).
+
+    The progressive-disclosure escape hatch: compact IDE renders (AGENTS.md /
+    GEMINI.md) end with "Full guide: run `knowledge skill show`" because their
+    always-on context budget can't hold the complete guide. Reuses the same
+    ``skill-template/SKILL.md`` resolution as ``cmd_install_skill``.
+    """
+    from . import skill_render
+
+    src_dir = Path(__file__).resolve().parent.parent / "skill-template"
+    skill_path = src_dir / "SKILL.md"
+    if not skill_path.is_file():
+        print(
+            f"error: skill template not found at {skill_path}\n"
+            "expected the repo-knowledge repo layout (editable install).",
+            file=sys.stderr,
+        )
+        return 1
+
+    skill_text = skill_path.read_text(encoding="utf-8")
+    print(skill_render.strip_frontmatter(skill_text).lstrip("\n"))
+    return 0
+
+
+_SKILL_DISPATCH = {
+    "show": cmd_skill_show,
+}
 
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:
@@ -3336,6 +3450,7 @@ _DISPATCH = {
     "graph": cmd_graph,
     "install-skill": cmd_install_skill,
     "install-hooks": cmd_install_hooks,
+    "skill": lambda args: _SKILL_DISPATCH[args.skill_cmd](args),
     "config": lambda args: _CONFIG_DISPATCH[args.config_cmd](args),
     "db": lambda args: _DB_DISPATCH[args.db_cmd](args),
 }
@@ -3509,7 +3624,10 @@ def cmd_db_init_postgres(args: argparse.Namespace) -> int:
 
     backend = PostgresBackend(s)
     try:
-        conn = backend.connect()
+        # init-postgres is where extension state can change (fresh install /
+        # recreation ⇒ new type OIDs) — bypass and rewrite the local type
+        # cache so it can never go stale across a re-init.
+        conn = backend.connect(refresh_types=True)
     except _DependencyMissing as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -3588,7 +3706,11 @@ def _ping_postgres(s) -> int:
 
     backend = PostgresBackend(s)
     try:
-        conn = backend.connect()
+        # ping is the triage verb — always re-fetch the pgvector type OIDs
+        # and rewrite the local type cache, so a server-side extension
+        # recreation (stale cached OIDs) is healed by the same command a
+        # user would naturally reach for.
+        conn = backend.connect(refresh_types=True)
     except _DependencyMissing as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

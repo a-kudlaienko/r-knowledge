@@ -42,6 +42,16 @@ def models_dir() -> Path:
     return p
 
 
+def pg_types_cache_path() -> Path:
+    """``~/.knowledge/pg_types_cache.json`` — cached pgvector type OIDs.
+
+    Keyed by sha256(host|port|dbname) so one file can hold entries for every
+    PostgreSQL target this laptop has connected to. See
+    ``backends/postgres.py`` module docstring for the invalidation story.
+    """
+    return user_dir() / "pg_types_cache.json"
+
+
 # Project-scoped config file name. Dropped into a repo root (or any cwd
 # ancestor); the file *closer to the cwd* wins over the laptop default.
 PROJECT_CONFIG_NAME = ".knowledge-config.json"
@@ -144,6 +154,25 @@ def outbox_file(root: Path) -> Path:
     history stage files. Drained on the next reachable ``knowledge`` command.
     """
     return project_stage_dir(root) / "outbox.jsonl"
+
+
+def query_cache_dir() -> Path:
+    """``~/.knowledge/cache/`` — local per-project query-cache files."""
+    p = user_dir() / "cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def query_cache_db(root: Path) -> Path:
+    """Per-project local SQLite file backing ``query_cache.py``.
+
+    Slug derivation mirrors :func:`project_stage_dir` (same
+    ``_slugify_root`` helper) so a repo root maps to a stable filename
+    regardless of storage mode (local sqlite or shared_postgresql) — the
+    query cache is local-only in both. Creates the parent dir; the file
+    itself is created lazily by ``query_cache.py`` on first connect.
+    """
+    return query_cache_dir() / f"{_slugify_root(root)}.sqlite"
 
 
 def root_sidecar_path(project_dir: Path) -> Path:

@@ -60,6 +60,7 @@ def ask(
     lang: str | None = None,
     top_k: int = config.DEFAULT_TOP_K,
     use_cache: bool = True,
+    index_stamp: float = 0.0,
 ) -> list[SearchResult]:
     """Full hybrid pipeline. Returns ``SearchResult`` list sorted by final score.
 
@@ -67,13 +68,25 @@ def ask(
     (lower is still "better" so the existing citations formatter doesn't
     need to flip signs). Call sites that care can recover the score as
     ``-r.distance``.
+
+    ``index_stamp`` should be ``max(last_build, last_update)`` from the
+    caller's already-fetched ``projects`` row — it's the cache's
+    cross-client invalidation signal (see ``knowledge/query_cache.py``).
+    Callers that don't have it (or don't care) can leave it at the
+    default; the cache then just keys on ``0.0``, which still round-trips
+    correctly but won't detect a stale index the way ``cmd_ask`` does.
     """
     fetch_k = max(top_k * _OVER_FETCH, 30)
 
-    # Cache lookup (pre-rerank).
+    # Cache lookup (pre-rerank) — LOCAL file, no main-DB round trip. This
+    # must stay before the embedder call in ``search.search`` below: a
+    # cache hit must never pay the cost of loading the embedding model.
     cache_key = query_cache.compute_key(query, kind, lang, top_k)
     head_sha = query_cache.get_head_sha(project_root)
-    cached = query_cache.get(conn, project_id, cache_key, head_sha) if use_cache else None
+    cached = (
+        query_cache.get(project_root, cache_key, head_sha, index_stamp)
+        if use_cache else None
+    )
     if cached is not None:
         return _rerank(conn, cached, project_id, project_root)[:top_k]
 
@@ -101,7 +114,7 @@ def ask(
     # Cache the pre-rerank output so the next call with the same query
     # skips FTS + vec + JOIN.
     if use_cache:
-        query_cache.put(conn, project_id, cache_key, head_sha, merged)
+        query_cache.put(project_root, cache_key, head_sha, index_stamp, merged)
 
     return _rerank(conn, merged, project_id, project_root)[:top_k]
 

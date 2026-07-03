@@ -67,9 +67,12 @@ def build_project(
             raise db.ProjectBusyError(project.name)
 
         # Any prior `ask` answer for this project is stale after a full
-        # rebuild — chunk IDs / file paths may change. Wipe within the
-        # same txn so cache state stays consistent with chunk state.
-        query_cache.wipe_project(conn, project.id)
+        # rebuild — chunk IDs / file paths may change. The query cache is
+        # a local file, not part of this (main-DB) transaction — this is
+        # prompt local cleanup; the `last_build` bump below (via
+        # update_counts / projects row) is what actually guarantees every
+        # OTHER client's cache misses too (see query_cache.py docstring).
+        query_cache.invalidate(root)
 
         # Clean slate for this project. SQLite vec0 has no FK cascade so
         # the helper wipes chunks_vec rows explicitly before chunks goes;
@@ -417,18 +420,25 @@ def update_project(
             # re-resolve any parametric edges against the new map.
             variables.apply_variables(conn, project.id, root)
 
-        db.execute(
-            conn,
-            "UPDATE projects SET last_update = ? WHERE id = ?",
-            (now, project.id),
-        )
-
-        # Invalidate cache only when something actually changed. A no-op
-        # update (all files byte-identical) shouldn't wipe cached answers
-        # that are still correct, which matters when the agent runs
-        # `knowledge update` as a hook on every turn.
+        # `last_update` only advances when something actually changed. A
+        # no-op update (all files byte-identical) must leave it alone:
+        # `query_cache`'s ``index_stamp`` is ``max(last_build, last_update)``
+        # (see cmd_ask / query_cache.py) — bumping it unconditionally would
+        # miss every cached `ask` after every no-op `knowledge update`,
+        # which matters a lot given the agent runs `update` as a hook on
+        # every turn. This is also the actual "did the corpus change"
+        # signal every OTHER client's cache checks against.
         if files_new or files_changed or files_deleted:
-            query_cache.wipe_project(conn, project.id)
+            db.execute(
+                conn,
+                "UPDATE projects SET last_update = ? WHERE id = ?",
+                (now, project.id),
+            )
+            # Prompt local cleanup for this machine's cache file — not
+            # required for correctness (the index_stamp bump above already
+            # makes every client, including this one, miss on next `ask`),
+            # just avoids carrying stale rows around until TTL expiry.
+            query_cache.invalidate(root)
 
     update_counts(conn, project.id)
 

@@ -313,6 +313,7 @@ User: "how does the karmada cert regeneration ansible task work"
 Two complementary stores:
 - **History** (`knowledge history stage|ingest|recent|search`) — free-form work summaries keyed by session/time. Good for "what did we do last Tuesday."
 - **Decisions** (`knowledge decide|decisions|resume`) — structured choices with topic/decision/rationale/files. Good for "why did we pick X over Y."
+- **Consolidate** (`knowledge consolidate`) — read-only report of recurring `history` themes not yet captured as a `decision`. Run periodically (end of a work stretch, or every few weeks) or when `resume` shows many history entries but few decisions. It never writes — review the candidates and record the real ones with `decide`.
 
 Use **history** for narrative, **decisions** for commitments. `resume` aggregates both plus git and staging state into one session-start brief.
 
@@ -441,9 +442,14 @@ knowledge vars import ansible /path/to/vars.json                      # bulk fro
 knowledge vars list [--scope ansible] [--json]
 knowledge vars unset ansible deploy_env                               # remove one
 knowledge vars unset ansible --all                                    # clear a scope
+knowledge vars unset --auto                                           # clear auto-loaded rows
 ```
 
-Every mutation auto-applies against the existing graph — no rebuild needed. Scope routing:
+Every mutation auto-applies against the existing graph — no rebuild needed.
+
+**Ansible auto-load.** `build`/`update` reads `group_vars/all*` and `host_vars/*` (project root, every `ansible.cfg` dir, every `inventory =` dir) into `scope='ansible'` automatically. Precedence per Ansible docs: inventory `group_vars/all` < playbook `group_vars/all` < inventory `host_vars/*` < playbook `host_vars/*`. Manual `vars set` rows always beat auto rows. `vars list` tags auto rows with `(auto:group_vars)` / `(auto:host_vars)`.
+
+Scope routing:
 
 | Edge kind | Syntax | Scope lookup order |
 |---|---|---|

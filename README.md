@@ -128,7 +128,7 @@ pip install -e .
 pip install -e '.[postgres]'
 ```
 
-> 🤖 **Using an AI coding agent?** Run `knowledge install-skill --ide all` to wire the skill into Claude Code, Cursor, Codex, and OpenCode — auto-build, auto-update, agent-first verbs.
+> 🤖 **Using an AI coding agent?** Run `knowledge install-skill --ide all` to wire the skill into Claude Code, Cursor, Codex, OpenCode, and Gemini — auto-build, auto-update, agent-first verbs.
 
 
 # Index any repo (first run downloads a ~130 MB embedding model)
@@ -335,7 +335,7 @@ Use `ask` for code questions, not history search.
 </details>
 
 <details>
-<summary>🤖 <strong>Agent / IDE integration (Claude Code, Cursor, Codex, OpenCode)</strong></summary>
+<summary>🤖 <strong>Agent / IDE integration (Claude Code, Cursor, Codex, OpenCode, Gemini)</strong></summary>
 
 The `knowledge` CLI is tool-agnostic — any agent that can run a shell uses it the same way. `install-skill` wires the *instruction file* into the location each tool discovers, all generated from one source (`skill-template/SKILL.md`):
 
@@ -343,7 +343,8 @@ The `knowledge` CLI is tool-agnostic — any agent that can run a shell uses it 
 knowledge install-skill                          # default → Claude Code (.claude/skills/knowledge/SKILL.md)
 knowledge install-skill --ide cursor             # → .cursor/rules/knowledge.mdc
 knowledge install-skill --ide codex,opencode     # → ./AGENTS.md  (shared; written once)
-knowledge install-skill --ide all                # all four at once
+knowledge install-skill --ide gemini             # → ./GEMINI.md
+knowledge install-skill --ide all                # all five at once
 knowledge install-skill --ide all --user         # user/global location per tool
 knowledge install-skill --ide claude --symlink   # auto-updates on git pull here
 knowledge install-skill --ide cursor --force     # overwrite an existing dedicated file
@@ -355,8 +356,13 @@ knowledge install-skill --ide cursor --force     # overwrite an existing dedicat
 | `cursor` | `.cursor/rules/knowledge.mdc` | *(project only)* |
 | `codex` | `AGENTS.md` | `~/.codex/AGENTS.md` |
 | `opencode` | `AGENTS.md` | `~/.config/opencode/AGENTS.md` |
+| `gemini` | `GEMINI.md` | `~/.gemini/GEMINI.md` |
 
-`codex` and `opencode` (and Cursor as a fallback) all read the same root **`AGENTS.md`** — it's written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved. Dedicated files (`SKILL.md`, `.mdc`) need `--force` to overwrite. Cursor's `.mdc` is an *agent-requested* rule by default (`alwaysApply: false`); pass `--always-apply` to attach it to every request.
+`codex`, `opencode`, and `gemini` (and Cursor as a fallback) all read a root instruction file — `AGENTS.md` for the first two, `GEMINI.md` for Gemini — written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved (no `--force` needed; re-installs just replace the block). Dedicated files (`SKILL.md`, `.mdc`) do need `--force` to overwrite. Cursor's `.mdc` is an *agent-requested* rule by default (`alwaysApply: false`); pass `--always-apply` to attach it to every request.
+
+`codex`/`opencode`/`gemini` get a **compact** instruction block (~8KB, priority directives + intent→verb table + auto-maintenance + decide/resume essentials + a short conflict-check + gotchas) — their instructions are injected into every session unconditionally, so the full ~32KB guide would be always-on token overhead. Any agent stuck with the compact form can pull the complete guide on demand with `knowledge skill show`. Cursor's `.mdc` stays the FULL guide since it's only pulled in when the agent judges it relevant.
+
+gemini-cli also supports a `contextFileName` setting that can point at `AGENTS.md` instead of `GEMINI.md`, if you'd rather not maintain a separate file for it.
 
 > 🔧 Maintainers: `AGENTS.md` and `knowledge.mdc` are generated from `SKILL.md` — run `make sync-skill` after editing it (CI guards drift via `tests/test_skill_sync.py`).
 

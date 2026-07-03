@@ -6,9 +6,16 @@ content in the format it discovers:
 
 | File | Read by | Form |
 |------|---------|------|
-| `SKILL.md` | Claude Code | YAML frontmatter (`name`/`description`/…) + body |
-| `AGENTS.md` | Codex, OpenCode, Cursor (root fallback) | plain prose, no frontmatter |
-| `knowledge.mdc` | Cursor (native scoped rule) | `.mdc` frontmatter + body |
+| `SKILL.md` | Claude Code | YAML frontmatter (`name`/`description`/…) + full body |
+| `AGENTS.md` | Codex, OpenCode, Cursor (root fallback) | plain prose, no frontmatter, **compact** (~8KB) |
+| `knowledge.mdc` | Cursor (native scoped rule) | `.mdc` frontmatter + **full** body |
+| `GEMINI.md` | Gemini (`gemini-cli`) | same content as `AGENTS.md`, installed to its own file via `--ide gemini` |
+
+`AGENTS.md`/`GEMINI.md` are compact by design: they're injected into every Codex/OpenCode/Gemini
+session unconditionally, so the full ~32KB guide would be always-on token overhead. Both end with
+"Full guide: run `knowledge skill show`" — that verb prints the complete `SKILL.md` body on
+demand. Cursor's `.mdc` stays the full body since it's only pulled in when the agent judges it
+relevant (`alwaysApply: false` by default).
 
 This directory also ships an optional second skill:
 - **`knowledge-bench`** (dir: `knowledge-bench/SKILL.md`) — A/B comparison. `/knowledge-bench <question>` answers the same question twice (once with grep only, once with `knowledge`) and prints a side-by-side verdict.
@@ -21,7 +28,8 @@ The easiest path is the bundled installer, which writes the right file for each 
 knowledge install-skill                       # Claude Code → .claude/skills/knowledge/SKILL.md
 knowledge install-skill --ide cursor          # → .cursor/rules/knowledge.mdc
 knowledge install-skill --ide codex,opencode  # → ./AGENTS.md (shared, merge-safe)
-knowledge install-skill --ide all             # all four
+knowledge install-skill --ide gemini          # → ./GEMINI.md (merge-safe)
+knowledge install-skill --ide all             # all five
 knowledge install-skill --ide all --symlink   # link instead of copy (follows upstream updates)
 ```
 
@@ -38,6 +46,9 @@ cp ~/git/repo-knowledge/skill-template/knowledge.mdc .cursor/rules/knowledge.mdc
 
 # Codex / OpenCode (root AGENTS.md)
 cp ~/git/repo-knowledge/skill-template/AGENTS.md ./AGENTS.md
+
+# Gemini (root GEMINI.md — same generated content as AGENTS.md)
+cp ~/git/repo-knowledge/skill-template/AGENTS.md ./GEMINI.md
 ```
 
 ### Benchmark skill (optional)
