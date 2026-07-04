@@ -1,4 +1,4 @@
-# 🧠 repo-knowledge
+# 🧠 r-knowledge or repo-knowledge
 
 > **Local semantic search + memory for your git repos.** Ask how code works, map dependencies, and pick up where you left off — fully offline, on your machine.
 
