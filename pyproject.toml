@@ -22,12 +22,22 @@ dependencies = [
     "apsw>=3.44",
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.7",
-    # tree-sitter-languages 1.10.x was built against the tree-sitter 0.21 C ABI.
-    # tree-sitter 0.22 changed Language() from (ptr, name) to (ptr) and breaks
-    # this bundled-grammars package. Pin both until a 2.x bundle ships, or
-    # migrate to per-language packages (tree-sitter-python etc.) in M4+.
-    "tree-sitter>=0.21,<0.22",
-    "tree-sitter-languages>=1.10,<2",
+    # tree-sitter-languages (bundled grammars, pinned tree-sitter<0.22) is
+    # abandoned upstream and ships no cp313 wheels — it broke CI on Python
+    # 3.13. tree-sitter-language-pack is the maintained successor for
+    # get_parser(name), BUT: as of 1.7 the project (now "Kreuzberg") rewrote
+    # its internals around a custom Rust-native Node/Tree/Parser API
+    # (str-only .parse(), node.kind()/.start_byte() as *methods*, no
+    # .children/.named_children lists) that is NOT drop-in compatible with
+    # our node-walking chunkers/resolvers, which expect the classic
+    # tree_sitter.Parser/Node surface (.parse(bytes), node.type, node.children,
+    # node.start_byte as attributes). Verified: 1.6.1 is the last release on
+    # the classic API, still ships cp310-abi3 wheels (Python-version-agnostic,
+    # confirmed working through 3.14) and pulls tree-sitter>=0.24 (which has
+    # its own cp313 wheels) — so it fixes the original CI break without the
+    # 1.7+ API rewrite. Do not bump past <1.7 without re-verifying get_parser's
+    # return type against tree_sitter.Parser first.
+    "tree-sitter-language-pack>=1.6.1,<1.7",
     "numpy>=1.26",
     "pathspec>=0.12",
     "pyyaml>=6.0",

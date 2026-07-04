@@ -11,8 +11,14 @@ from __future__ import annotations
 
 # Schema + chunker versioning. Bump CHUNKER_VERSION when chunking rules change
 # in a way that invalidates existing chunks (forces rebuild via meta mismatch).
+# Bumped 2 -> 3: tree-sitter-languages -> tree-sitter-language-pack migration
+# (Python 3.13 CI fix). Same get_parser(name) surface and node-walking logic,
+# but the grammars themselves are newer upstream builds; chunk boundaries can
+# shift subtly even though extraction code is unchanged. Forcing a rebuild
+# here avoids a silently-inconsistent index with some chunks parsed by the
+# old grammars and some by the new ones.
 SCHEMA_VERSION = "2"
-CHUNKER_VERSION = "2"
+CHUNKER_VERSION = "3"
 
 # Embedding model. BAAI/bge-small-en-v1.5: 384-dim, ~130MB, strong MTEB
 # score for mixed code+text retrieval, 512-token window.

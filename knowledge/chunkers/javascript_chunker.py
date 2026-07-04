@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tree_sitter_languages import get_parser
+from tree_sitter_language_pack import get_parser
 
 from .base import BaseChunker, Chunk
 
