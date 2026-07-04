@@ -98,6 +98,23 @@ def test_render_agents_compact_includes_whitelisted_sections(skill_text: str) ->
         assert f"## {heading}" in compact
 
 
+def test_render_agents_compact_carries_fact_workflow(skill_text: str) -> None:
+    """The always-on render must teach agents when and how to record facts."""
+    compact = skill_render.render_agents_compact(skill_text)
+    for required in (
+        "knowledge fact",
+        "--context",
+        "--why",
+        "--supersede",
+        "--override-reason",
+        "decisions --search",
+        "resume",
+        "conflict checks",
+        "Four blocks in order",
+    ):
+        assert required in compact
+
+
 def test_render_agents_full_is_escape_hatch(skill_text: str) -> None:
     # full=True must reproduce the old verbatim-body behavior exactly.
     full = skill_render.render_agents(skill_text, full=True)

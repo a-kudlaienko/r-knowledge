@@ -12,7 +12,7 @@ These four rules apply on every invocation. They exist because they reduce tool-
 
 3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
 
-4. **Log non-obvious choices with `knowledge decide` as you make them, not at session end.** Each decision is embedded — `knowledge resume` surfaces the latest five every new session, and `knowledge decisions --search "<topic>"` finds older ones. A two-minute `decide` call today saves a 20-minute "why did we do this" excavation next week.
+4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`.
 
 ## Pre-change conflict check (MANDATORY)
 
@@ -86,22 +86,24 @@ knowledge decide "cache invalidation" \
   --files knowledge/query_cache.py knowledge/indexer.py
 ```
 
-Topic + decision are the keys. Rationale and file list are optional but valuable — the rationale is what future-you actually needs to remember.
-
-Every decision is **stamped with an author** (git `user.name <user.email>`, falling back to the UNIX login when there's no git identity) — so in shared-DB mode teammates can see who set each standard.
+Topic and decision are required; rationale/files preserve the useful why and blast radius. Every row is author-stamped (git identity, then UNIX-login fallback) for shared-DB attribution.
 
 **Overriding a prior decision** (changing an established standard) requires an explicit acknowledgment:
 
 - `--supersede <id>` links the new decision to the one it overrides.
 - The tool **blocks (exit 3)** until `--override-reason "<why>"` is supplied — a teammate relying on the old behavior deserves to know why it changed.
-- A plain `decide` whose topic exactly matches an existing one prints a non-blocking `note:` nudging you toward `--supersede` (it does not block — same topic is sometimes legitimate).
+- Reusing an exact topic without `--supersede` is legal but prints a non-blocking override nudge.
+
+### `fact` — record a working fix, lesson, or project-related research finding
+
+Record a non-obvious fix/research result with `knowledge fact "<topic>" --fact "<rule>" --context "<raw symptom>" --why "<evidence>" [--files PATH ...]`. Facts share decisions' attributed/embedded store and appear in search, resume, and conflict checks with a `[fact]` marker; pasted symptoms find them. Better fix: `--supersede <id> --override-reason "<why>"` (same gated chain). Keep this workflow in tracked skill templates; never rely on user-local/gitignored instruction or lessons files.
 
 ### `decisions` — list or semantically search
 
 ```bash
 knowledge decisions --limit 5
 knowledge decisions --topic cache              # substring filter on topic
-knowledge decisions --search "how to handle stale caches"   # semantic over topic+decision
+knowledge decisions --search "how to handle stale caches"   # semantic over decisions+facts+context
 ```
 
 ### `resume` — the session-start brief
@@ -111,8 +113,6 @@ knowledge resume
 ```
 
 Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
-
-Found a working fix for a non-obvious problem, or a research result worth keeping? → `knowledge fact "<topic>" --fact "<finding>" --context "<symptom>"` — same store as `decide` (`kind=fact`), searchable by symptom text, shown with a `[fact]` marker.
 
 ## Rules / gotchas
 

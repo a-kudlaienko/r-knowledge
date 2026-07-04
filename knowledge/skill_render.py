@@ -91,7 +91,10 @@ COMPACT_SECTION_WHITELIST = [
 # render past its token budget. Comfortably above what today's whitelisted
 # sections need (see tests/test_skill_sync.py for the measured byte count) —
 # they bind only if a section grows substantially.
-_COMPACT_SECTION_MAX_CHARS = 2000
+# Session memory now carries both decision and fact workflows. Keep enough
+# room for its final resume summary; the separate 8,448-byte regression guard
+# still caps the complete always-on artifact.
+_COMPACT_SECTION_MAX_CHARS = 2200
 _COMPACT_MAX_CODE_BLOCKS_PER_SUBSECTION = 1
 
 _AGENTS_FOOTER = "Full guide: run `knowledge skill show`."
