@@ -11,33 +11,39 @@ Default: one SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, histo
 
 ## Priority directives — READ FIRST
 
-These four rules apply on every invocation. They exist because they reduce tool-call count, prevent re-opening solved problems, and keep cross-session continuity intact.
+These rules have scoped triggers: session resume applies at session start; the conflict gate applies only at the planning/material-execution transition defined below.
 
 1. **On a new session, run `knowledge resume` BEFORE any other tool** in this skill.  It returns last decisions + touched files + any un-ingested stage entries + hub files. ~1200 tokens, <200ms. Skip only when the user's very first message makes it obvious (e.g. a typo fix on a specific line).
 
-2. **Pre-change conflict check (MANDATORY before any plan or non-trivial change).** See the dedicated section below. The user has lost time to changes that re-opened already-solved problems because a new session had no memory of the prior fight. This check is non-negotiable — even when the request looks small.
+2. **Conflict preflight is a transition gate, not an invocation/query gate.** Run it before concrete implementation planning or material state-changing execution—not for ordinary read-only questions or exploration.
 
 3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
 
 4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`.
 
-## Pre-change conflict check (MANDATORY)
+## Pre-change conflict gate (planning / execution only)
 
-Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does — including `knowledge fact` entries (working fixes), not just `decide` choices.
+This is a transition gate, not a query gate. Do **not** run it merely because `/knowledge` was invoked or the user asked a question. Skip it for read-only Q&A, explanations, code navigation/search, status/history, summaries, reviews, diagnosis, and mechanical typo/format-only edits with no behavioral impact.
 
-**Required queries (run in parallel when possible):**
+Run it once when work crosses into either:
 
-1. `knowledge decisions --search "<topic>"` — prior `knowledge decide` entries on the same area.
-2. `knowledge history search "<topic>"` — past work-log entries: incidents, rollbacks, painful fixes.
-3. `knowledge relations <file>` for each file you intend to touch — hidden coupling that was likely the *reason* for an earlier decision.
-4. `knowledge ask "what did we decide / fix about <topic>?"` — semantic catch-all when the topic word is fuzzy.
+- a concrete implementation, refactor, or migration plan/specification; or
+- material execution: behavioral code/config/schema/dependency edits, migrations, deploys, commits, or other state changes.
+
+If exploration later becomes a plan/change, run the gate at that transition. Re-run only when the topic, scope, or intended files materially change—not before every step.
+
+**Required queries when triggered (parallel where possible):**
+
+1. `knowledge decisions --search "<topic>"` — prior decisions and facts.
+2. `knowledge history search "<topic>"` — incidents, rollbacks, and recent milestones.
+3. `knowledge ask "what did we decide / fix about <topic>?"` — semantic catch-all.
+4. Once candidate files are known, `knowledge relations <file>` for each one before editing.
 
 **STOP conditions — halt and surface to the user before continuing if ANY apply:**
 
-- The proposed change contradicts a prior `knowledge decide` entry.
-- The proposed change matches a pattern that previously caused an incident in `knowledge history` (e.g. "we tried this last month and it broke X").
-- The user's request appears to undo work captured in a recent `knowledge history` milestone.
-- The change touches a hub file or high-blast-radius file with no prior decision context (ask before proceeding).
+- Proposed work contradicts a prior decision/fact.
+- It repeats an incident or undoes a recent history milestone.
+- It touches a hub/high-blast-radius file with no prior context.
 
 **Required warning format when stopping** (do not silently push through):
 

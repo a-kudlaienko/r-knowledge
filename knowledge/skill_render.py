@@ -80,7 +80,7 @@ def extract_description(text: str) -> str:
 # (still available in full via `knowledge skill show`).
 COMPACT_SECTION_WHITELIST = [
     "Priority directives — READ FIRST",
-    "Pre-change conflict check (MANDATORY)",
+    "Pre-change conflict gate (planning / execution only)",
     "Finding code — intent → verb",
     "Auto-maintenance — run BEFORE any query verb",
     "Session memory — `decide` + `resume`",

@@ -115,6 +115,26 @@ def test_render_agents_compact_carries_fact_workflow(skill_text: str) -> None:
         assert required in compact
 
 
+def test_render_agents_compact_scopes_conflict_gate(skill_text: str) -> None:
+    """Read-only questions must not trigger the expensive conflict bundle."""
+    compact = skill_render.render_agents_compact(skill_text)
+    for required in (
+        "transition gate, not a query gate",
+        "Skip it for read-only Q&A",
+        "concrete implementation, refactor, or migration plan",
+        "material execution",
+        "Re-run only when the topic, scope, or intended files materially change",
+        "Once candidate files are known",
+    ):
+        assert required in compact
+    for forbidden in (
+        "These four rules apply on every invocation",
+        "before each major step",
+        "even when the request looks small",
+    ):
+        assert forbidden not in compact
+
+
 def test_render_agents_full_is_escape_hatch(skill_text: str) -> None:
     # full=True must reproduce the old verbatim-body behavior exactly.
     full = skill_render.render_agents(skill_text, full=True)
