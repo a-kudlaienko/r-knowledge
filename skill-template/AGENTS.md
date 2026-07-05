@@ -4,33 +4,39 @@
 
 ## Priority directives — READ FIRST
 
-These four rules apply on every invocation. They exist because they reduce tool-call count, prevent re-opening solved problems, and keep cross-session continuity intact.
+These rules have scoped triggers: session resume applies at session start; the conflict gate applies only at the planning/material-execution transition defined below.
 
 1. **On a new session, run `knowledge resume` BEFORE any other tool** in this skill.  It returns last decisions + touched files + any un-ingested stage entries + hub files. ~1200 tokens, <200ms. Skip only when the user's very first message makes it obvious (e.g. a typo fix on a specific line).
 
-2. **Pre-change conflict check (MANDATORY before any plan or non-trivial change).** See the dedicated section below. The user has lost time to changes that re-opened already-solved problems because a new session had no memory of the prior fight. This check is non-negotiable — even when the request looks small.
+2. **Conflict preflight is a transition gate, not an invocation/query gate.** Run it before concrete implementation planning or material state-changing execution—not for ordinary read-only questions or exploration.
 
 3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
 
-4. **Log non-obvious choices with `knowledge decide` as you make them, not at session end.** Each decision is embedded — `knowledge resume` surfaces the latest five every new session, and `knowledge decisions --search "<topic>"` finds older ones. A two-minute `decide` call today saves a 20-minute "why did we do this" excavation next week.
+4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`.
 
-## Pre-change conflict check (MANDATORY)
+## Pre-change conflict gate (planning / execution only)
 
-Before drafting a plan, before writing/editing any file, and before each major step within a multi-step plan, query the index for prior decisions and incidents on the same topic. Sessions are weeks apart; the user will not remember every prior fight, and neither will you. The index does — including `knowledge fact` entries (working fixes), not just `decide` choices.
+This is a transition gate, not a query gate. Do **not** run it merely because `/knowledge` was invoked or the user asked a question. Skip it for read-only Q&A, explanations, code navigation/search, status/history, summaries, reviews, diagnosis, and mechanical typo/format-only edits with no behavioral impact.
 
-**Required queries (run in parallel when possible):**
+Run it once when work crosses into either:
 
-1. `knowledge decisions --search "<topic>"` — prior `knowledge decide` entries on the same area.
-2. `knowledge history search "<topic>"` — past work-log entries: incidents, rollbacks, painful fixes.
-3. `knowledge relations <file>` for each file you intend to touch — hidden coupling that was likely the *reason* for an earlier decision.
-4. `knowledge ask "what did we decide / fix about <topic>?"` — semantic catch-all when the topic word is fuzzy.
+- a concrete implementation, refactor, or migration plan/specification; or
+- material execution: behavioral code/config/schema/dependency edits, migrations, deploys, commits, or other state changes.
+
+If exploration later becomes a plan/change, run the gate at that transition. Re-run only when the topic, scope, or intended files materially change—not before every step.
+
+**Required queries when triggered (parallel where possible):**
+
+1. `knowledge decisions --search "<topic>"` — prior decisions and facts.
+2. `knowledge history search "<topic>"` — incidents, rollbacks, and recent milestones.
+3. `knowledge ask "what did we decide / fix about <topic>?"` — semantic catch-all.
+4. Once candidate files are known, `knowledge relations <file>` for each one before editing.
 
 **STOP conditions — halt and surface to the user before continuing if ANY apply:**
 
-- The proposed change contradicts a prior `knowledge decide` entry.
-- The proposed change matches a pattern that previously caused an incident in `knowledge history` (e.g. "we tried this last month and it broke X").
-- The user's request appears to undo work captured in a recent `knowledge history` milestone.
-- The change touches a hub file or high-blast-radius file with no prior decision context (ask before proceeding).
+- Proposed work contradicts a prior decision/fact.
+- It repeats an incident or undoes a recent history milestone.
+- It touches a hub/high-blast-radius file with no prior context.
 
 **Required warning format when stopping** (do not silently push through):
 
@@ -86,22 +92,24 @@ knowledge decide "cache invalidation" \
   --files knowledge/query_cache.py knowledge/indexer.py
 ```
 
-Topic + decision are the keys. Rationale and file list are optional but valuable — the rationale is what future-you actually needs to remember.
-
-Every decision is **stamped with an author** (git `user.name <user.email>`, falling back to the UNIX login when there's no git identity) — so in shared-DB mode teammates can see who set each standard.
+Topic and decision are required; rationale/files preserve the useful why and blast radius. Every row is author-stamped (git identity, then UNIX-login fallback) for shared-DB attribution.
 
 **Overriding a prior decision** (changing an established standard) requires an explicit acknowledgment:
 
 - `--supersede <id>` links the new decision to the one it overrides.
 - The tool **blocks (exit 3)** until `--override-reason "<why>"` is supplied — a teammate relying on the old behavior deserves to know why it changed.
-- A plain `decide` whose topic exactly matches an existing one prints a non-blocking `note:` nudging you toward `--supersede` (it does not block — same topic is sometimes legitimate).
+- Reusing an exact topic without `--supersede` is legal but prints a non-blocking override nudge.
+
+### `fact` — record a working fix, lesson, or project-related research finding
+
+Record a non-obvious fix/research result with `knowledge fact "<topic>" --fact "<rule>" --context "<raw symptom>" --why "<evidence>" [--files PATH ...]`. Facts share decisions' attributed/embedded store and appear in search, resume, and conflict checks with a `[fact]` marker; pasted symptoms find them. Better fix: `--supersede <id> --override-reason "<why>"` (same gated chain). Keep this workflow in tracked skill templates; never rely on user-local/gitignored instruction or lessons files.
 
 ### `decisions` — list or semantically search
 
 ```bash
 knowledge decisions --limit 5
 knowledge decisions --topic cache              # substring filter on topic
-knowledge decisions --search "how to handle stale caches"   # semantic over topic+decision
+knowledge decisions --search "how to handle stale caches"   # semantic over decisions+facts+context
 ```
 
 ### `resume` — the session-start brief
@@ -111,8 +119,6 @@ knowledge resume
 ```
 
 Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
-
-Found a working fix for a non-obvious problem, or a research result worth keeping? → `knowledge fact "<topic>" --fact "<finding>" --context "<symptom>"` — same store as `decide` (`kind=fact`), searchable by symptom text, shown with a `[fact]` marker.
 
 ## Rules / gotchas
 

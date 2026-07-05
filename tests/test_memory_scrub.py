@@ -407,6 +407,9 @@ def test_cmd_fact_end_to_end(tmp_db, project_id, stub_embedder, tmp_path, monkey
     monkeypatch.setattr(projects_mod, "current_project_root", lambda *a, **kw: root)
     monkeypatch.setattr(projects_mod, "current_author", lambda *a, **kw: "Test Author")
     monkeypatch.setattr(cli_mod.db, "connect", lambda *a, **kw: tmp_db)
+    monkeypatch.setattr(
+        "knowledge.paths.outbox_file", lambda _root: tmp_path / "outbox.jsonl"
+    )
 
     args = argparse.Namespace(
         topic="pg-types-cache-stale-oid",
@@ -437,6 +440,56 @@ def test_cmd_fact_end_to_end(tmp_db, project_id, stub_embedder, tmp_path, monkey
     assert embed_text.startswith("pg-types-cache-stale-oid :: ")
     assert GITHUB_PAT not in embed_text
     assert "CHANGE_ME" in embed_text
+
+
+def test_cmd_fact_supersedes_with_same_gate_and_author_chain(
+    tmp_db, project_id, stub_embedder, tmp_path, monkeypatch
+):
+    """A better fact uses the decision override gate and attribution chain."""
+    import argparse
+
+    import knowledge.cli as cli_mod
+    import knowledge.decisions as decisions_mod
+    import knowledge.projects as projects_mod
+
+    # Match the root used by the ``project_id`` fixture: supersede ids are
+    # deliberately project-scoped, so a different synthetic root must fail.
+    root = Path("/tmp/test-project-scrub")
+    prior_id = decisions_mod.add(
+        tmp_db,
+        project_id=project_id,
+        topic="cache-fix",
+        decision="old fix",
+        kind="fact",
+        author="Prior Author",
+    )
+
+    monkeypatch.setattr(projects_mod, "current_project_root", lambda *a, **kw: root)
+    monkeypatch.setattr(projects_mod, "current_author", lambda *a, **kw: "New Author")
+    monkeypatch.setattr(cli_mod.db, "connect", lambda *a, **kw: tmp_db)
+    monkeypatch.setattr(
+        "knowledge.paths.outbox_file", lambda _root: tmp_path / "outbox.jsonl"
+    )
+
+    args = argparse.Namespace(
+        topic="cache-fix",
+        fact_text="better fix",
+        context="same raw symptom",
+        rationale="verified by the regression test",
+        files=["knowledge/decisions.py"],
+        session_id=None,
+        supersede=prior_id,
+        override_reason="the old fix was incomplete",
+        project=None,
+    )
+
+    assert cli_mod.cmd_fact(args) == 0
+    row = tmp_db.execute(
+        "SELECT kind, author, supersedes, override_reason FROM decisions "
+        "WHERE topic = ? ORDER BY id DESC LIMIT 1",
+        ("cache-fix",),
+    ).fetchone()
+    assert row == ("fact", "New Author", prior_id, "the old fix was incomplete")
 
 
 # ---------------------------------------------------------------------------
