@@ -217,7 +217,8 @@ pip install -e .
 pip install -e '.[postgres]'
 ```
 
-> 🤖 **Using an AI coding agent?** Run `knowledge install-skill --ide all` to wire the skill into Claude Code, Cursor, Codex, OpenCode, and Gemini — auto-build, auto-update, agent-first verbs.
+## 📚️ Install the skill
+**Run `knowledge install-skill --ide all` to wire the skill into Claude Code, Cursor, Codex, OpenCode, and Gemini — auto-build, auto-update, agent-first verbs.**
 
 
 # Index any repo (first run downloads a ~130 MB embedding model)
