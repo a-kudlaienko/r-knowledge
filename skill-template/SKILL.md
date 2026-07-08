@@ -17,7 +17,7 @@ These rules have scoped triggers: session resume applies at session start; the c
 
 2. **Conflict preflight is a transition gate, not an invocation/query gate.** Run it before concrete implementation planning or material state-changing execution—not for ordinary read-only questions or exploration.
 
-3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
+3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha), and now prefaces matching prior `decide`/`fact` entries inline. `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
 
 4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`.
 
@@ -159,9 +159,10 @@ knowledge ask "how does vault auto_load inject secrets"
 knowledge ask "octavia LB floating IP" --top-k 5
 knowledge ask "cert regen" --budget 2000           # soft token budget for citation list
 knowledge ask "<question>" --no-cache              # force fresh (skip 1h cache)
+knowledge ask "<question>" --no-decisions          # skip the prior decisions/facts preface
 ```
 
-RRF merge of vec + FTS, reranked by last-30d git, current session stage, and import-graph hub in-degree. Cached per (query, HEAD sha) with 1h TTL; invalidated in the same txn whenever the indexer mutates a chunk.
+RRF merge of vec + FTS, reranked by last-30d git, current session stage, and import-graph hub in-degree. Cached per (query, HEAD sha) with 1h TTL; invalidated in the same txn whenever the indexer mutates a chunk. `ask` also prefaces the most relevant prior `decide`/`fact` entries (semantic match over the decisions store) so read-only answers don't miss a recorded choice; suppress with `--no-decisions`.
 
 ### `why <path>` — one-file brief
 

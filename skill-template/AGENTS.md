@@ -10,7 +10,7 @@ These rules have scoped triggers: session resume applies at session start; the c
 
 2. **Conflict preflight is a transition gate, not an invocation/query gate.** Run it before concrete implementation planning or material state-changing execution—not for ordinary read-only questions or exploration.
 
-3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha). `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
+3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha), and now prefaces matching prior `decide`/`fact` entries inline. `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
 
 4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`.
 

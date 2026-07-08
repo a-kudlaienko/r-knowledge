@@ -108,6 +108,13 @@ EXT_TO_LANG = {
 # Default top-k for search (overridable per-query).
 DEFAULT_TOP_K = 10
 
+# `knowledge ask` decisions preface: how many decisions/facts to surface.
+ASK_DECISION_TOP_K = 3
+# Maximum semantic distance for a decision/fact hit to appear in `ask` output.
+# Calibrated empirically: relevant hits cluster at 0.59–0.906; unrelated at
+# 0.999+. 0.92 admits all clearly-on-topic entries and rejects off-topic noise.
+ASK_DECISION_MAX_DISTANCE = 0.92
+
 # Staleness threshold for `status`: if any scanned file has mtime newer than
 # this many seconds past last_update, the project is "stale". Zero means
 # strict equality — any modification makes it stale.

@@ -123,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("citations", "chunks", "json"),
         default="citations",
     )
+    p_ask.add_argument(
+        "--no-decisions",
+        action="store_true",
+        help="Skip the prior decisions/facts preface",
+    )
 
     # why — 6-line file brief (Phase 2 cartography).
     p_why = sub.add_parser(
@@ -1086,6 +1091,40 @@ def _first_line(text: str, max_chars: int = 160) -> str:
     return ""
 
 
+def _filter_decision_hits(hits, max_dist: float):
+    """Return only hits whose distance is <= *max_dist*."""
+    return [(d, dist) for (d, dist) in hits if dist <= max_dist]
+
+
+def _print_ask_decisions(hits) -> None:
+    """Print a compact preface of prior decisions/facts relevant to an ``ask`` query.
+
+    Prints nothing when *hits* is empty.  Otherwise emits a header line and one
+    compact line per hit so agents see recorded choices before reading code
+    citations.
+
+    Format::
+
+        ⚑ prior decisions/facts (heed before answering):
+          [kind] topic — first-line-of-decision (trimmed to 120 chars)  (id=N, YYYY-MM-DD, dist=D.DD)
+
+    Followed by one blank line to visually separate the block from citations.
+    """
+    if not hits:
+        return
+    from datetime import datetime
+
+    print("⚑ prior decisions/facts (heed before answering):")
+    for d, dist in hits:
+        when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
+        excerpt = _first_line(d.decision, max_chars=120)
+        print(
+            f"  [{d.kind}] {d.topic} — {excerpt}"
+            f"  (id={d.id}, {when}, dist={dist:.2f})"
+        )
+    print()
+
+
 def cmd_decide(args: argparse.Namespace) -> int:
     """Record a decision (or, via ``cmd_fact``, a fact) — Phase 4 session
     memory / Item H. ``kind``/``context`` default to a plain decision when
@@ -1572,6 +1611,8 @@ def _print_consolidate(report, covered_threshold: float = 0.68) -> None:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Hybrid search + rerank + cache — Phase 3 entry point for agents."""
+    from . import config as _config
+    from . import decisions as decisions_mod
     from . import hybrid_search
 
     with db.connect() as conn:
@@ -1592,6 +1633,20 @@ def cmd_ask(args: argparse.Namespace) -> int:
             use_cache=not args.no_cache,
             index_stamp=index_stamp,
         )
+        # Decisions preface — only for the default citations format and unless
+        # the caller opted out.  Runs inside the same conn block so
+        # decisions.search can use the open connection.
+        if args.format == "citations" and not args.no_decisions:
+            dec_hits = decisions_mod.search(
+                conn,
+                args.question,
+                project_id=proj.id,
+                top_k=_config.ASK_DECISION_TOP_K,
+            )
+            dec_hits = _filter_decision_hits(
+                dec_hits, _config.ASK_DECISION_MAX_DISTANCE
+            )
+            _print_ask_decisions(dec_hits)
 
     kept, omitted = hybrid_search.truncate_to_budget(results, args.budget)
     _emit_results(kept, args.format)
