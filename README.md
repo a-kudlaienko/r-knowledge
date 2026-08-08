@@ -239,6 +239,7 @@ knowledge ask "how does X work?"
 | 🧭 **Orient** | `knowledge why <file>` · `map` · `brief` | Understand a file or tree before reading it |
 | 🕸️ **Graph** | `knowledge relations <file>` · `graph` | Imports, callers, blast radius |
 | 🧠 **Remember** | `knowledge resume` · `decide` · `history` · `consolidate` | Decisions + work log across sessions |
+| ✏️ **Correct** | `knowledge patch <id>` · `delete <id> --yes` | Amend or remove a decision/fact row in place |
 | 🔄 **Maintain** | `knowledge update` · `status --json` | Keep the index fresh (`missing`/`stale`/`fresh`) |
 
 > 💡 **Sharpen retrieval** by prefixing queries with a *kind hint*: `python function:`, `terraform resource:`, `ansible task:`, `helm template:`, `docs:`. → [full table in Details ↓](#-details)
@@ -458,6 +459,13 @@ knowledge fact "pg-types-cache-stale-oid" \
   --files knowledge/backends/postgres.py
 ```
 
+**`knowledge patch <id>`** / **`knowledge delete <id> --yes`** correct a decision/fact row after the fact. `patch` amends only the flags you pass and re-embeds if the embedded text changed — use it when a row is partly wrong (mechanism right, one detail off), so the fix lands on the *same* row instead of adding retrieval noise. `delete` removes a row (and its vector) outright, gated on `--yes` — use it only when the row's subject no longer exists at all. `--supersede` (above) stays for a genuine decision reversal where the history matters: a supersede keeps *both* rows surfacing in `ask`'s decisions banner, which is exactly the noise `patch`/`delete` avoid for corrections/dead rows.
+
+```bash
+knowledge patch 42 --context "confirmed on v1.30, not v1.29" --why "re-tested"
+knowledge delete 42 --yes
+```
+
 **Consolidate** (`knowledge consolidate`) is a **read-only** audit that closes the gap between the two stores: it semantically clusters recurring `history` themes and flags any *not yet captured as a `decision`*, printing a ready-to-fill `decide` scaffold for each. It never writes — you review the candidates and record the real ones. Themes already covered by an existing decision are skipped, so a clean run means your decision log is keeping pace with your work. Scans the last 90 days by default (`--days`); tune `--similarity` / `--covered` to widen or tighten.
 
 Use `ask` for code questions, not history search.
@@ -488,9 +496,9 @@ knowledge install-skill --ide cursor --force     # overwrite an existing dedicat
 | `opencode` | `AGENTS.md` | `~/.config/opencode/AGENTS.md` |
 | `gemini` | `GEMINI.md` | `~/.gemini/GEMINI.md` |
 
-`codex`, `opencode`, and `gemini` (and Cursor as a fallback) all read a root instruction file — `AGENTS.md` for the first two, `GEMINI.md` for Gemini — written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved (no `--force` needed; re-installs just replace the block). Dedicated files (`SKILL.md`, `.mdc`) do need `--force` to overwrite. Cursor's `.mdc` is an *agent-requested* rule by default (`alwaysApply: false`); pass `--always-apply` to attach it to every request.
+`codex`, `opencode`, and `gemini` (and Cursor as a fallback) all read a root instruction file — `AGENTS.md` for the first two, `GEMINI.md` for Gemini — written once and merged into a `<!-- BEGIN/END knowledge skill -->` block, so any content you already keep there is preserved (no `--force` needed; re-installs just replace the block). Dedicated files (`SKILL.md`, `.mdc`) do need `--force` to overwrite. Cursor's `.mdc` uses **`alwaysApply: true` by default** so agents run the session bootstrap and sandbox guidance every turn; pass `--no-always-apply` on install for agent-requested mode.
 
-`codex`/`opencode`/`gemini` get a **compact** instruction block (~8KB, priority directives + intent→verb table + auto-maintenance + decide/resume essentials + a short conflict-check + gotchas) — their instructions are injected into every session unconditionally, so the full ~32KB guide would be always-on token overhead. Any agent stuck with the compact form can pull the complete guide on demand with `knowledge skill show`. Cursor's `.mdc` stays the FULL guide since it's only pulled in when the agent judges it relevant.
+`codex`/`opencode`/`gemini` get a **compact** instruction block (~8KB, priority directives + intent→verb table + agent shell environment + auto-maintenance + decide/resume essentials + a short conflict-check + gotchas) — their instructions are injected into every session unconditionally, so the full ~32KB guide would be always-on token overhead. Any agent stuck with the compact form can pull the complete guide on demand with `knowledge skill show`. Cursor's `.mdc` ships the **full** guide (always-on by default).
 
 gemini-cli also supports a `contextFileName` setting that can point at `AGENTS.md` instead of `GEMINI.md`, if you'd rather not maintain a separate file for it.
 

@@ -13,8 +13,9 @@ artifacts from the *same body*:
   disclosure). Also used verbatim (via managed-block merge) for Gemini's
   ``GEMINI.md``.
 - ``skill-template/knowledge.mdc`` — Cursor ``.mdc`` frontmatter + FULL body.
-  Cursor rules are agent-requested (pulled in on demand via the frontmatter
-  ``description``), not always-on, so there is no token-budget pressure here.
+  Default ``alwaysApply: true`` so Cursor agents load the protocol every session
+  (pass ``always_apply=False`` to ``regenerate()`` / ``--no-always-apply`` on
+  install for agent-requested mode).
 
 ``knowledge install-skill`` copies/symlinks/merges these siblings into a
 target repo. Run ``python -m knowledge.skill_render`` (or ``make sync-skill``)
@@ -82,8 +83,10 @@ COMPACT_SECTION_WHITELIST = [
     "Priority directives — READ FIRST",
     "Pre-change conflict gate (planning / execution only)",
     "Finding code — intent → verb",
+    "Agent shell environment (Cursor and sandboxed agents)",
     "Auto-maintenance — run BEFORE any query verb",
     "Session memory — `decide` + `resume`",
+    "Correcting memory — `patch` + `delete`",
     "Rules / gotchas",
 ]
 
@@ -246,13 +249,12 @@ def render_agents(skill_text: str, *, full: bool = False) -> str:
     return render_agents_compact(skill_text)
 
 
-def render_cursor(skill_text: str, *, always_apply: bool = False) -> str:
+def render_cursor(skill_text: str, *, always_apply: bool = True) -> str:
     """Render the Cursor ``.mdc`` form: ``.mdc`` frontmatter + banner + body.
 
-    ``alwaysApply: false`` (default) makes this an *Agent-Requested* rule —
-    Cursor pulls it in when the task is relevant, via the ``description``,
-    instead of prepending the whole body to every prompt. Pass
-    ``always_apply=True`` to attach it unconditionally.
+    ``alwaysApply: true`` (default) attaches the rule to every Cursor request so
+    agents run the session bootstrap and avoid sandbox pitfalls. Pass
+    ``always_apply=False`` for agent-requested mode (pulled in via ``description``).
     """
     description = extract_description(skill_text)
     body = strip_frontmatter(skill_text).lstrip("\n")
@@ -265,7 +267,7 @@ def render_cursor(skill_text: str, *, always_apply: bool = False) -> str:
     return f"{frontmatter}\n{GENERATED_BANNER}\n\n{body}"
 
 
-def regenerate(skill_dir: Path | None = None, *, always_apply: bool = False) -> list[Path]:
+def regenerate(skill_dir: Path | None = None, *, always_apply: bool = True) -> list[Path]:
     """Regenerate AGENTS.md + knowledge.mdc from SKILL.md. Returns written paths."""
     skill_dir = skill_dir or _skill_template_dir()
     skill_text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")

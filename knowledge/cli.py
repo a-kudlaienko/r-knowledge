@@ -250,6 +250,45 @@ def main(argv: list[str] | None = None) -> int:
         help="Print untruncated decision/why text (default: compact, ~200/120 char truncation).",
     )
 
+    # patch — correct one decision/fact row in place (the one exception to
+    # the append-only store; see knowledge/decisions.py module docstring).
+    p_patch = sub.add_parser(
+        "patch",
+        help="Correct one decision/fact row in place (topic/decision/context/why/files).",
+    )
+    p_patch.add_argument("decision_id", type=int, metavar="ID")
+    p_patch.add_argument("--topic", help="New short label")
+    p_patch.add_argument("--decision", dest="decision_arg", help="New choice text")
+    p_patch.add_argument(
+        "--fact",
+        dest="fact_arg",
+        help="New finding/fix text — alias for --decision, reads better for kind='fact'.",
+    )
+    p_patch.add_argument("--context", help="New raw symptom text")
+    p_patch.add_argument("--why", dest="rationale", help="New evidence/why text")
+    p_patch.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Replace the files-touched list",
+    )
+    p_patch.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_patch.add_argument("--format", choices=("text", "json"), default="text")
+
+    # delete — remove one decision/fact row whose subject no longer exists.
+    p_delete = sub.add_parser(
+        "delete",
+        help="Delete one decision/fact row (its subject no longer exists).",
+    )
+    p_delete.add_argument("decision_id", type=int, metavar="ID")
+    p_delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the delete (required — no interactive prompt).",
+    )
+    p_delete.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_delete.add_argument("--format", choices=("text", "json"), default="text")
+
     # resume — opinionated session-start brief.
     p_resume = sub.add_parser(
         "resume",
@@ -540,8 +579,8 @@ def main(argv: list[str] | None = None) -> int:
             "(or 'all' for all five). Default: claude — "
             ".claude/skills/knowledge/SKILL.md. codex/opencode/gemini get the "
             "COMPACT AGENTS-style render (see `knowledge skill show` for the "
-            "full guide); cursor's .mdc stays full (agent-requested, not "
-            "always-on)."
+            "full guide); cursor's .mdc is the full guide with alwaysApply: true "
+            "by default (use --no-always-apply for agent-requested mode)."
         ),
     )
     p_install.add_argument(
@@ -556,8 +595,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_install.add_argument(
         "--always-apply",
-        action="store_true",
-        help="Cursor only: set alwaysApply: true in the .mdc (default: false, agent-requested)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cursor only: set alwaysApply in .mdc (default: true). "
+             "Use --no-always-apply for agent-requested mode.",
     )
     p_install.add_argument(
         "--force",
@@ -1334,6 +1375,143 @@ def cmd_decisions(args: argparse.Namespace) -> int:
         ))
     else:
         _print_decisions(entries, full=args.full)
+    return 0
+
+
+def cmd_patch(args: argparse.Namespace) -> int:
+    """Correct one decision/fact row in place — the normal fix for a typo
+    or stale wording (the store is append-only otherwise)."""
+    from . import decisions as decisions_mod
+
+    if args.decision_arg is not None and args.fact_arg is not None:
+        print("error: pass either --decision or --fact, not both", file=sys.stderr)
+        return 2
+    decision_text = args.decision_arg if args.decision_arg is not None else args.fact_arg
+
+    if (
+        args.topic is None
+        and decision_text is None
+        and args.context is None
+        and args.rationale is None
+        and args.files is None
+    ):
+        print(
+            "error: nothing to patch — pass at least one of "
+            "--topic / --decision (or --fact) / --context / --why / --files",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Same non-empty invariant cmd_decide enforces on insert (topic/decision
+    # are required, non-blank fields) — patch must not let a correction blank
+    # one out. --context/--why/--files stay unchecked: an empty string there
+    # is the documented way to clear that half (see decisions.patch()).
+    if args.topic is not None and not args.topic.strip():
+        print("error: --topic must be non-empty", file=sys.stderr)
+        return 2
+    if decision_text is not None and not decision_text.strip():
+        label = "--fact" if args.fact_arg is not None else "--decision"
+        print(f"error: {label} must be non-empty", file=sys.stderr)
+        return 2
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+
+        # Same id-validation shape as --supersede in _decide_online: fetch
+        # first so a wrong-project id gets a clean error instead of silently
+        # patching (or 404-ing on) a row that isn't this project's.
+        target = decisions_mod.get(conn, args.decision_id)
+        if target is None or target.project_id != proj.id:
+            print(
+                f"error: no decision id={args.decision_id} in "
+                f"'{proj.name}' ({proj.root_path})",
+                file=sys.stderr,
+            )
+            return 2
+
+        result = decisions_mod.patch(
+            conn,
+            args.decision_id,
+            topic=args.topic,
+            decision=decision_text,
+            context=args.context,
+            rationale=args.rationale,
+            files_touched=args.files,
+        )
+        if result is None:
+            # Only reachable if the row vanished between the get() above and
+            # here — i.e. a teammate deleted it concurrently on shared PG.
+            # Narrow, but report it like every other miss instead of raising
+            # a TypeError from unpacking None.
+            print(
+                f"error: decision id={args.decision_id} disappeared "
+                "mid-patch (deleted concurrently?)",
+                file=sys.stderr,
+            )
+            return 2
+        updated, re_embedded = result
+
+    if args.format == "json":
+        print(json.dumps(
+            {"decision": updated._asdict(), "re_embedded": re_embedded},
+            indent=2,
+            default=str,
+        ))
+    else:
+        _print_decisions([(updated, None)], full=True)
+        print(f"re-embedded: {'yes' if re_embedded else 'no'}")
+    return 0
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Delete one decision/fact row — used when its subject no longer
+    exists. No interactive prompt (agents can't answer one): the row is
+    always printed first, then the delete is blocked without ``--yes``.
+    """
+    from . import decisions as decisions_mod
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_error(conn, args.project)
+        if proj is None:
+            return 1
+
+        target = decisions_mod.get(conn, args.decision_id)
+        if target is None or target.project_id != proj.id:
+            print(
+                f"error: no decision id={args.decision_id} in "
+                f"'{proj.name}' ({proj.root_path})",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Look this up before deleting — referencing() would return nothing
+        # once the row itself is gone.
+        refs = decisions_mod.referencing(conn, args.decision_id)
+
+        if args.format == "json":
+            print(json.dumps({"decision": target._asdict()}, indent=2, default=str))
+        else:
+            _print_decisions([(target, None)], full=True)
+
+        if not args.yes:
+            print("error: refusing to delete without --yes", file=sys.stderr)
+            return 3
+
+        decisions_mod.delete(conn, args.decision_id)
+
+    if refs:
+        ids = ", ".join(f"id={r.id}" for r in refs)
+        print(
+            f"warning: {len(refs)} row(s) superseded id={args.decision_id} "
+            f"and now dangle: {ids}",
+            file=sys.stderr,
+        )
+    if args.format == "json":
+        print(json.dumps({"deleted": True, "id": args.decision_id}, indent=2))
+    else:
+        print(f"deleted: id={args.decision_id} from '{proj.name}' ({proj.root_path})")
     return 0
 
 
@@ -3594,6 +3772,8 @@ _DISPATCH = {
     "decide": cmd_decide,
     "fact": cmd_fact,
     "decisions": cmd_decisions,
+    "patch": cmd_patch,
+    "delete": cmd_delete,
     "resume": cmd_resume,
     "consolidate": cmd_consolidate,
     "get": cmd_get,

@@ -1140,3 +1140,49 @@ def insert_decision_embedding(conn, decision_id: int, vec) -> None:
         "INSERT INTO decisions_vec(decision_id, embedding) VALUES (?, ?)",
         (decision_id, vec.tobytes()),
     )
+
+
+def delete_decision_embedding(conn, decision_id: int) -> None:
+    """Wipe the embedding row for one decision whose parent row is about to
+    be deleted too (used by :func:`knowledge.decisions.delete`).
+
+    SQLite: ``decisions_vec`` is a virtual table without FK cascade — must
+    be cleaned explicitly, same split as :func:`delete_chunk_embeddings_by_ids`.
+    PostgreSQL: ``decision_embeddings.decision_id`` has ``ON DELETE CASCADE``
+    to ``decisions(id)`` — a no-op here, the caller's DELETE FROM decisions
+    sweeps it.
+    """
+
+    if current_mode() == "postgresql":
+        return
+    conn.execute(
+        "DELETE FROM decisions_vec WHERE decision_id = ?",
+        (decision_id,),
+    )
+
+
+def replace_decision_embedding(conn, decision_id: int, vec) -> None:
+    """Replace one decision's embedding in place — delete then insert.
+
+    Used by :func:`knowledge.decisions.patch` when the embedded text changes
+    but the parent decision row survives — unlike :func:`delete_decision_embedding`,
+    the delete here must actually run on BOTH backends (no cascade to lean
+    on, the row it would delete isn't going away), otherwise the following
+    insert collides with the still-present PK (PostgreSQL) / rowid
+    (SQLite). No UPDATE helper exists because vec0 won't reliably UPDATE an
+    embedding column.
+    """
+
+    if current_mode() == "postgresql":
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM decision_embeddings WHERE decision_id = %s",
+                (decision_id,),
+            )
+        insert_decision_embedding(conn, decision_id, vec)
+        return
+    conn.execute(
+        "DELETE FROM decisions_vec WHERE decision_id = ?",
+        (decision_id,),
+    )
+    insert_decision_embedding(conn, decision_id, vec)

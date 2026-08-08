@@ -14,8 +14,9 @@ content in the format it discovers:
 `AGENTS.md`/`GEMINI.md` are compact by design: they're injected into every Codex/OpenCode/Gemini
 session unconditionally, so the full ~32KB guide would be always-on token overhead. Both end with
 "Full guide: run `knowledge skill show`" — that verb prints the complete `SKILL.md` body on
-demand. Cursor's `.mdc` stays the full body since it's only pulled in when the agent judges it
-relevant (`alwaysApply: false` by default).
+demand. Cursor's `.mdc` ships the **full** body with `alwaysApply: true` by default so
+agents run session bootstrap every turn; pass `--no-always-apply` on install for
+agent-requested mode.
 
 This directory also ships an optional second skill:
 - **`knowledge-bench`** (dir: `knowledge-bench/SKILL.md`) — A/B comparison. `/knowledge-bench <question>` answers the same question twice (once with grep only, once with `knowledge`) and prints a side-by-side verdict.

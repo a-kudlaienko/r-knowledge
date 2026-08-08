@@ -1,6 +1,6 @@
 ---
 name: knowledge
-description: Local code cartography + semantic search for the current repo. Navigate (find / grep), orient (why / map / brief), search (ask — hybrid FTS+vector+rerank, cached), and remember across sessions (decide / fact / resume). Auto-builds or updates the local index. Use BEFORE raw Grep / Read for anything meaning-shaped.
+description: Local code cartography + semantic search for the current repo. Navigate (find / grep), orient (why / map / brief), search (ask — hybrid FTS+vector+rerank, cached), and remember across sessions (decide / fact / resume, corrected via patch / delete). Auto-builds or updates the local index. Use BEFORE raw Grep / Read for anything meaning-shaped.
 argument-hint: [verb] [args]
 allowed-tools: Bash Read
 ---
@@ -13,13 +13,17 @@ Default: one SQLite DB at `~/.knowledge/index.sqlite` holds chunks, edges, histo
 
 These rules have scoped triggers: session resume applies at session start; the conflict gate applies only at the planning/material-execution transition defined below.
 
-1. **On a new session, run `knowledge resume` BEFORE any other tool** in this skill.  It returns last decisions + touched files + any un-ingested stage entries + hub files. ~1200 tokens, <200ms. Skip only when the user's very first message makes it obvious (e.g. a typo fix on a specific line).
+1. **On a new session, bootstrap the index then resume** — use **three separate**
+   shell invocations in order (see [Agent shell environment](#agent-shell-environment-cursor-and-sandboxed-agents)):
+   `knowledge status --json` → `knowledge update` or `knowledge build` if state is
+   not `fresh` → `knowledge resume`. ~1200 tokens after update. Skip only when the
+   user's very first message makes it obvious (e.g. a typo fix on a specific line).
 
 2. **Conflict preflight is a transition gate, not an invocation/query gate.** Run it before concrete implementation planning or material state-changing execution—not for ordinary read-only questions or exploration.
 
 3. **Default to `knowledge ask` instead of `knowledge search`.** `ask` runs FTS + vector in parallel, merges via RRF, reranks by recency/session/hub centrality, caches by (query, HEAD sha), and now prefaces matching prior `decide`/`fact` entries inline. `search` is the vector-only raw-chunks path — use it only when you need `--top-k` with distance scores or downstream scripting.
 
-4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`.
+4. **Record durable memory as you discover it, not at session end.** Use `knowledge decide` for non-obvious choices and `knowledge fact` for working fixes/research findings. Both are embedded, surfaced by `resume`, and found by `decisions --search`. Fix a detail with `knowledge patch <id>`; remove a dead row with `knowledge delete <id> --yes`.
 
 ## Pre-change conflict gate (planning / execution only)
 
@@ -80,7 +84,39 @@ Only after these return paths and line ranges: **Read** those slices. Built-in *
 
 ### Escalation order
 
-`knowledge` (resume → status → relations / ask / find / grep / why) → `docs/` → targeted **Read** → **Grep**/**Glob** only on a path the index already returned.
+`knowledge` (status → update if stale → resume → relations / ask / find / grep / why) → `docs/` → targeted **Read** → **Grep**/**Glob** only on a path the index already returned.
+
+## Agent shell environment (Cursor and sandboxed agents)
+
+IDE agents (especially **Cursor**) often run shell commands in a **sandbox** scoped
+to the project workspace. The knowledge index lives **outside** the repo at
+`~/.knowledge/index.sqlite` (sqlite mode) and needs **read+write** there — SQLite
+WAL journaling writes `-wal` / `-shm` siblings next to the DB.
+
+**Required when invoking any `knowledge` command from an agent:**
+
+1. **Run from the indexed repo root** (`git rev-parse --show-toplevel`).
+2. **Request unrestricted filesystem permissions** for the shell tool when the
+   host supports it (e.g. Cursor `required_permissions: ["all"]`). Without this,
+   `knowledge db ping` / `resume` / `ask` may fail with `unable to open database
+   file` even though the CLI is installed.
+3. **Use separate shell invocations** — do **not** chain `knowledge` verbs in one
+   compound command, pipe `resume` to `head`/`tail`, or redirect stderr to
+   `/dev/null`. Those patterns hide failures (SIGPIPE exit 1, swallowed errors).
+4. **Never skip auto-maintenance** — `stale` index → run `knowledge update` *before*
+   `resume` or `ask`.
+
+**Session-start bootstrap (three commands, in order):**
+
+```bash
+knowledge status --json
+# missing → knowledge build | stale → knowledge update | fresh → continue
+knowledge resume
+```
+
+Only after bootstrap (or when the first message is a trivial line fix): use
+`knowledge ask` / `find` / `grep` for meaning-shaped questions — not repo-wide
+`Grep` / `Glob`.
 
 ## Auto-maintenance — run BEFORE any query verb
 
@@ -238,6 +274,24 @@ knowledge resume
 
 Four blocks in order: last 5 decisions, 10 most-touched files (7d), un-ingested stage entries, top 3 hub files. ~1200 tokens, idempotent. Run first on every new session.
 
+## Correcting memory — `patch` + `delete`
+
+### `patch <id>` — amend a recorded fact/decision in place
+
+```bash
+knowledge patch 42 --context "confirmed on v1.30, not v1.29" --why "re-tested"
+```
+
+Updates only the flags passed (`--topic`/`--decision`/`--fact`/`--context`/`--why`/`--files`); other fields stay put, re-embeds only if the embedded text changed. Use when the mechanism was right but a detail was wrong — no duplicate-row noise.
+
+### `delete <id>` — remove one row entirely
+
+```bash
+knowledge delete 42 --yes
+```
+
+Deletes the row and its vector — gated on `--yes`. Use only when the subject no longer exists. For a genuine reversal, use `--supersede` on `decide` — it keeps BOTH rows in `ask`'s decisions banner (top-3 by distance), so using it for a correction crowds out other memory; `patch` avoids that.
+
 ## `search` — raw-chunks flow (legacy / specialist use)
 
 Kept for when you need ranked vector results without RRF/rerank/cache — e.g. comparing distances, piping to downstream code, or debugging retrieval.
@@ -303,6 +357,7 @@ knowledge path <chunk_id>                      # file_path:start_line-end_line
 
 ## Rules / gotchas
 
+- **Sandboxed agents** — Cursor and similar hosts may block `~/.knowledge/` unless the shell runs with full filesystem permissions; see [Agent shell environment](#agent-shell-environment-cursor-and-sandboxed-agents). Never chain or pipe `knowledge` commands.
 - **First build is slow** — cold-start downloads the 130MB embedding model to `~/.knowledge/models/`. Warn the user before running `build` on a fresh machine.
 - **Don't commit the DB** — `~/.knowledge/index.sqlite` is per-machine. Each teammate rebuilds locally.
 - **`.gitignore` is honored.** Secret-shaped files (`.env`, `*.pem`, etc.) that are gitignored are never scanned. Regex + structured-key sanitization scrub the rest. Any `CHANGE_ME` token in search results is either a user placeholder or a sanitizer replacement — never a real leaked secret.
@@ -313,13 +368,12 @@ knowledge path <chunk_id>                      # file_path:start_line-end_line
 
 User: "how does the karmada cert regeneration ansible task work"
 
-1. New session → `knowledge resume` to load prior context.
-2. `knowledge status --json` → `{"state": "fresh", ...}` → no maintenance needed
-3. `knowledge ask "karmada cert regeneration" --kind ansible_task --top-k 5`
-4. Top result: `ansible/roles/karmada/tasks/main.yml:47-55 | ansible_task | name: Regenerate Karmada TLS certificates`
-5. `knowledge why ansible/roles/karmada/tasks/regenerate_certs.yml` for the included file's neighbors.
-6. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`.
-7. If this invoked a non-obvious design choice, `knowledge decide "karmada cert rotation approach" --decision "..." --files ansible/roles/karmada/tasks/regenerate_certs.yml`.
+1. New session → `knowledge status --json` → `knowledge update` if `stale` → `knowledge resume`.
+2. `knowledge ask "karmada cert regeneration" --kind ansible_task --top-k 5`
+3. Top result: `ansible/roles/karmada/tasks/main.yml:47-55 | ansible_task | name: Regenerate Karmada TLS certificates`
+4. `knowledge why ansible/roles/karmada/tasks/regenerate_certs.yml` for the included file's neighbors.
+5. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`.
+6. If this invoked a non-obvious design choice, `knowledge decide "karmada cert rotation approach" --decision "..." --files ansible/roles/karmada/tasks/regenerate_certs.yml`.
 
 ## Continuity / memory — cross-session RAG over past work
 

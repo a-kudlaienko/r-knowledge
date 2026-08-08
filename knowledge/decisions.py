@@ -129,6 +129,167 @@ def add(
     return new_id
 
 
+def _split_rationale(stored: str | None) -> tuple[str | None, str | None]:
+    """Inverse of the context-into-rationale fold in :func:`add`.
+
+    ``add()`` writes the ``rationale`` column as exactly one of:
+
+    * ``None`` — no context, no rationale
+    * ``"<rationale>"`` — plain ``decide`` path, no context
+    * ``"Symptom: <context>"`` — ``fact`` path, no rationale
+    * ``"Symptom: <context>\\n\\nWhy it works: <rationale>"`` — ``fact`` path, both
+
+    Returns ``(context, rationale)``. Input that doesn't start with the
+    ``"Symptom: "`` label is the plain ``decide`` path — passed through
+    verbatim as the rationale half with ``context=None``.
+
+    Known limitation (bounded, verified non-destructive): the labels are
+    prose, not delimiters, so user text that mimics them is misread — a
+    ``rationale`` beginning ``"Symptom: "`` is taken for a context, and a
+    ``context`` containing ``"\\n\\nWhy it works: "`` splits at that point.
+    Re-folding always reproduces the stored string byte-for-byte in both
+    cases (no data loss, and repeated patches don't accumulate labels), so
+    the only effect is which half a later patch treats as embeddable. The
+    ambiguity is inherited from :func:`add`'s single-column fold, not
+    introduced here; a real ``context`` column would be the actual fix.
+    """
+    if not stored:
+        return None, None
+    prefix = "Symptom: "
+    if not stored.startswith(prefix):
+        return None, stored
+    sep = "\n\nWhy it works: "
+    if sep in stored:
+        context, why = stored.split(sep, 1)
+        return context[len(prefix):], why
+    return stored[len(prefix):], None
+
+
+def patch(
+    conn: Connection,
+    decision_id: int,
+    *,
+    topic: str | None = None,
+    decision: str | None = None,
+    context: str | None = None,
+    rationale: str | None = None,
+    files_touched: list[str] | None = None,
+) -> tuple[Decision, bool] | None:
+    """Update one row in place — the normal correction path for a bad
+    ``decide``/``fact`` entry. Only fields passed as non-``None`` change;
+    omitted fields keep their stored value. Returns ``None`` if
+    ``decision_id`` doesn't exist.
+
+    ``context``/``rationale`` share the single ``rationale`` column (see
+    module docstring + :func:`add`) — patching one half rebuilds the
+    composite via :func:`_split_rationale` so the other half already
+    stored survives untouched. ``created_at``, ``author``, ``kind``,
+    ``supersedes``, ``override_reason`` and ``project_id`` are never
+    modified here.
+
+    Re-embeds ONLY when the embedded triple (``topic``, ``decision``,
+    ``context``) actually changed value — not merely supplied unchanged.
+    ``rationale`` alone is never embedded, matching :func:`add`. Returns
+    ``(updated, re_embedded)`` so the CLI can report whether the vector
+    was refreshed.
+    """
+    current = get(conn, decision_id)
+    if current is None:
+        return None
+
+    new_topic = scrub_text(topic) if topic is not None else current.topic
+    new_decision = scrub_text(decision) if decision is not None else current.decision
+
+    old_context, old_why = _split_rationale(current.rationale)
+    new_context = scrub_text(context) if context is not None else old_context
+    new_why = scrub_text(rationale) if rationale is not None else old_why
+
+    if new_context:
+        # Same fold as add(): label both halves, why is optional.
+        parts = [f"Symptom: {new_context}"]
+        if new_why:
+            parts.append(f"Why it works: {new_why}")
+        new_stored_rationale = "\n\n".join(parts)
+    else:
+        new_stored_rationale = new_why
+
+    re_embed = (
+        new_topic != current.topic
+        or new_decision != current.decision
+        or new_context != old_context
+    )
+
+    new_files = files_touched if files_touched is not None else current.files_touched
+    files_json = json.dumps(new_files) if new_files else None
+
+    # Embed BEFORE opening the transaction, exactly as add() does. encode() can
+    # be a daemon round-trip or a cold 130MB model load; doing it inside the
+    # transaction would hold the SQLite write lock (or an open PG transaction)
+    # for that whole time. Failing here leaves the row untouched, which is the
+    # same outcome as failing inside — so there's nothing to gain by waiting.
+    vec = None
+    if re_embed:
+        text_to_embed = (
+            f"{new_topic} :: {new_decision} :: {new_context}"
+            if new_context
+            else f"{new_topic} :: {new_decision}"
+        )
+        vec = get_embedder().encode([text_to_embed])[0]
+
+    with db.transaction(conn):
+        db.execute(
+            conn,
+            "UPDATE decisions SET topic = ?, decision = ?, rationale = ?, "
+            "files_touched = ? WHERE id = ?",
+            (new_topic, new_decision, new_stored_rationale, files_json, decision_id),
+        )
+        if vec is not None:
+            db.replace_decision_embedding(conn, decision_id, vec)
+
+    updated = current._replace(
+        topic=new_topic,
+        decision=new_decision,
+        rationale=new_stored_rationale,
+        files_touched=new_files,
+    )
+    return updated, re_embed
+
+
+def delete(conn: Connection, decision_id: int) -> bool:
+    """Delete one row + its embedding. Returns True if it existed.
+
+    Used when the subject of a decision/fact no longer exists — the only
+    other delete path is the whole-project cascade in
+    :func:`knowledge.projects.forget_project`. Deletes the vector before
+    the row (mirrors that function): the SQLite vec0 table has no FK
+    cascade, so :func:`db.delete_decision_embedding` cleans it explicitly;
+    PostgreSQL cascades on the row delete and no-ops there instead.
+
+    Does NOT touch rows that ``supersedes`` this one — see
+    :func:`referencing` for finding them.
+    """
+    with db.transaction(conn):
+        db.delete_decision_embedding(conn, decision_id)
+        deleted = db.execute(conn, "DELETE FROM decisions WHERE id = ?", (decision_id,))
+    return deleted > 0
+
+
+def referencing(conn: Connection, decision_id: int) -> list[Decision]:
+    """Rows whose ``supersedes`` points at ``decision_id``.
+
+    ``supersedes`` has no FK constraint on either backend, so deleting a
+    superseded row leaves a silent dangling pointer here — the caller
+    (``knowledge delete``) uses this to warn about it, not to rewrite
+    anything.
+    """
+    rows = db.fetch_all(
+        conn,
+        f"SELECT {_SELECT_COLS} FROM decisions WHERE supersedes = ?",
+        (decision_id,),
+    )
+    return [_row_to_decision(r) for r in rows]
+
+
 def exact_topic_match(
     conn: Connection, project_id: int, topic: str
 ) -> Decision | None:

@@ -13,7 +13,7 @@ Local semantic code search, dependency cartography, and session memory. Default 
 | `paths.py` | Filesystem locations (`~/.knowledge/`, overridable via `KNOWLEDGE_HOME`) | `user_dir`, `db_path`, `models_dir`, `home_config_path`, `stage_dir` |
 | `config.py` | Hardcoded constants | `MODEL`, `EMBEDDING_DIM`, `MAX_CHARS`, `SCHEMA_VERSION`, `CHUNKER_VERSION`, `INCLUDE_GLOBS` |
 | `settings.py` | Load `.knowledge-config.json` (walk-up + `~/.knowledge/config.json` fallback); resolve PG DSN from env | `load_settings`, `resolve_pg_dsn`, `Settings` |
-| `db.py` | Connection factory + schema/meta helpers; delegates to active backend | `connect`, `init_schema`, `get_meta`, `set_meta` |
+| `db.py` | Connection factory + schema/meta helpers + **bulk-write family** (backend-forked: `COPY`/`nextval` on PG, `executemany`/`MAX(id)+1` on SQLite); delegates to active backend | `connect`, `init_schema`, `get_meta`, `set_meta`, `reserve_ids`, `copy_chunk_rows`, `copy_file_rows`, `copy_file_edge_rows`, `insert_chunk_embeddings_bulk`, `bulk_touch_files`, `bulk_update_chunk_positions`, `bulk_update_file_rows`, `delete_chunks_by_ids`, `wipe_file_edges`, `fetch_chunks_for_files` |
 | `backends/base.py` | Backend ABC (connect, transaction, advisory lock) | `Backend` |
 | `backends/sqlite.py` | Default laptop backend — APSW + sqlite-vec | `SqliteBackend` |
 | `backends/postgres.py` | Team-shared backend — psycopg3 + pgvector + tsvector | `PostgresBackend` |
@@ -28,7 +28,7 @@ Local semantic code search, dependency cartography, and session memory. Default 
 | `chunkers/` | Language → chunker registry + per-lang parsers | `dispatch_chunker`, `PythonChunker`, `HclChunker`, `CSharpChunker`, `FSharpChunker`, `VisualBasicChunker`, `MSBuildChunker`, … |
 | `big_split.py` | Oversized chunks → `big_parent` + `big_subchunk` | `split_if_oversized` |
 | `embedder.py` | sentence-transformers loader + batch encode | `Embedder`, `get_embedder` |
-| `indexer.py` | Scan → chunk → sanitize → embed → upsert; build + incremental update | `build_project`, `update_project` |
+| `indexer.py` | Scan → chunk → sanitize → embed → **bulk-write**; unified `build` + incremental `update` (one path, both backends — collects then flushes via the `db.py` bulk family) | `build_project`, `update_project`, `_scan_file`, `_classify_update_chunks`, `_build_update_rows` |
 | `search.py` | Vector query + project scoping; chunk retrieval | `search`, `get_chunk`, `get_family`, `SearchResult` |
 | `fts.py` | FTS5 queries over chunk text (no embedder) | `grep`, symbol/name lookup helpers |
 | `hybrid_search.py` | Parallel FTS + vector, RRF merge, rerank | `ask` |
@@ -37,8 +37,9 @@ Local semantic code search, dependency cartography, and session memory. Default 
 | `history.py` | Work-summary store; embeds `short_summary`, stores `long_summary` | `add`, `search`, `recent`, `get`, `ingest_stage` |
 | `decisions.py` | Structured decision log (topic + decision + rationale) | `add_decision`, `search_decisions`, `recent_decisions` |
 | `resume.py` | Session-start brief aggregator | `build_resume_brief` |
+| `consolidate.py` | Recurring-theme gap report over history vs decisions (read-only) | `build`, `cluster_entries`, `coverage_gap`, `suggest_topic` |
 | `resolvers/` | Per-language edge extractors | `dispatch_resolver`, `PythonResolver`, `HelmResolver`, `ArgoCDResolver`, … |
-| `relations.py` | File-edge store + resolution (imports, includes, chart refs) | `FileIndex`, `extract_edges`, `get_forward`, `get_reverse`, `stats` |
+| `relations.py` | File-edge store + resolution (imports, includes, chart refs); `resolve_edges` is the pure resolver (no DB), edges bulk-written via `db.copy_file_edge_rows` | `FileIndex`, `extract_edges`, `resolve_edges`, `insert_edges`, `get_forward`, `get_reverse`, `stats` |
 | `variables.py` | Per-project vars for Jinja / Terraform substitution | `set_many`, `apply_variables`, `substitute` |
 | `graph.py` | Dependency graph → self-contained HTML (vis-network) | `build_graph_html` |
 | `cache.py` | Byte-bounded LRU (internal shim) | `ByteBoundedLRU` |
@@ -71,7 +72,7 @@ files (`csharp`/`fsharp`/`visual_basic` langs) intentionally have **no** resolve
 | Search | `ask`, `search`, `find`, `grep`, `get`, `path` |
 | Cartography | `why`, `map`, `brief` |
 | Graph | `relations`, `graph`, `vars` |
-| Memory | `history` (add/stage/ingest/recent/search/get), `decide`, `decisions`, `resume` |
+| Memory | `history` (add/stage/ingest/recent/search/get), `decide`, `decisions`, `resume`, `consolidate`, `patch`, `delete` |
 | Admin | `projects`, `stats`, `forget` |
 | Config / DB | `config` (init/show/check-env), `db` (ping/init-postgres/migrate) |
 | Integration | `install-skill`, `install-hooks` |
