@@ -498,51 +498,14 @@ If `relations` returns `error: file not indexed` for a file you know exists, run
 
 ### Variables — resolving `{{ var }}` and `${var.x}` paths
 
-Some edges (mostly Ansible `include_tasks`/`include_role` and Terraform `templatefile`/`source`) carry template expressions like `_tasks/{{ deploy_env }}/...` or `source = "./${var.env}"`. Without the variables, these edges show as `kind="parametric"` with no `file` — the LLM can see *something* is there but not where it points.
+Edges carrying template expressions (Ansible `include_tasks`/`include_role`, Terraform `templatefile`/`source`) show as `kind="parametric"` with no `file` until their variables are known — you can see *something* is there but not where it points. `knowledge vars set <scope> k=v` resolves them and auto-applies to the existing graph, no rebuild. Ansible `group_vars`/`host_vars` auto-load on `build`/`update`.
 
-Set per-project variables (scoped by domain) to resolve them:
-
-```bash
-knowledge vars set ansible deploy_env=prod region=us-east            # multi-kv
-knowledge vars set terraform env=prod                                 # scoped separately
-knowledge vars set all region=us-east-1                               # catch-all merged into any scope
-knowledge vars import ansible /path/to/vars.json                      # bulk from JSON
-knowledge vars list [--scope ansible] [--json]
-knowledge vars unset ansible deploy_env                               # remove one
-knowledge vars unset ansible --all                                    # clear a scope
-knowledge vars unset --auto                                           # clear auto-loaded rows
-```
-
-Every mutation auto-applies against the existing graph — no rebuild needed.
-
-**Ansible auto-load.** `build`/`update` reads `group_vars/all*` and `host_vars/*` (project root, every `ansible.cfg` dir, every `inventory =` dir) into `scope='ansible'` automatically. Precedence per Ansible docs: inventory `group_vars/all` < playbook `group_vars/all` < inventory `host_vars/*` < playbook `host_vars/*`. Manual `vars set` rows always beat auto rows. `vars list` tags auto rows with `(auto:group_vars)` / `(auto:host_vars)`.
-
-Scope routing:
-
-| Edge kind | Syntax | Scope lookup order |
-|---|---|---|
-| `ansible_*` | Jinja `{{ name }}` | `ansible`, then `all` |
-| `helm_*` | Jinja `{{ name }}` | `helm`, then `all` |
-| `tf_*` | Terraform `${var.name}` | `terraform`, then `all` |
-
-**Display kinds for NULL-target edges:**
-- `parametric` — waiting for variables. Set them with `vars set`.
-- `external` — resolved to not-a-project-file (stdlib / third-party / remote module source).
-- `unresolved` — syntactically irrecoverable (e.g., `import_module(some_expr)` with a non-literal arg).
-
-**Not substituted:** Jinja filters (`{{ x | lower }}` → takes `x`, ignores filter), loop vars (`{{ item }}`, `{{ role_item }}`), nested attrs (`{{ foo.bar }}`), arithmetic/expressions. Those stay parametric by design — set a concrete value if you want them resolved.
+Full reference — the `vars` subcommands, scope routing per edge kind, auto-load precedence, the `parametric`/`external`/`unresolved` display kinds, and what is deliberately *not* substituted: **[`docs/variables.md`](../docs/variables.md)**.
 
 ### Visualize the graph (HTML)
 
-When the user wants to *see* the dependency shape (e.g. "what's the overall structure here", "show me the graph", "are there cycles"), render it to a static HTML:
+`knowledge graph` renders the dependency shape to a single self-contained HTML (default `./relations_graph.html`) — for "what's the overall structure here", "show me the graph", "are there cycles".
 
-```bash
-knowledge graph                                    # writes ./relations_graph.html
-knowledge graph --output /tmp/graph.html --open    # write to specific path + launch browser
-knowledge graph --include-external                 # include stdlib / third-party as gray nodes
-knowledge graph --include-parametric               # include vars-waiting as yellow nodes
-```
+It is a **display** command, not a query command: it writes a file and prints its path. Don't reach for it on a narrow "where does X point" question — `knowledge relations <file>` is faster and more focused.
 
-One project per run (`--project` overrides the cwd default). The rendered file is a single self-contained HTML with vis-network loaded from CDN — open in any browser, hover a node for the full project-relative path + language, drag nodes, scroll to zoom. Nodes are colored by top-level directory. The default scope is resolved project-to-project edges only (cleanest for large repos); opt in to `external` / `parametric` / `unresolved` via the flags above.
-
-This is a **display** command, not a query command — it writes a file to disk and prints its path. Don't use it when the user asks a narrow "where does X point" question; `knowledge relations <file>` is faster and more focused for that.
+Flags, node colouring, and the `external`/`parametric` scope opt-ins: **[`docs/graph-visualization.md`](../docs/graph-visualization.md)**.

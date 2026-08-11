@@ -12,6 +12,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from typing import NamedTuple
 
 # tree-sitter-languages 1.10.x calls Language(path, name), which tree-sitter
 # deprecated in 0.21. We pin to that combo (see tree-sitter-abi-pin memory),
@@ -725,7 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     # install-hooks
     p_hooks = sub.add_parser(
         "install-hooks",
-        help="Register Stop + PreCompact + SessionEnd hooks for auto-ingest",
+        help="Register Stop + PreCompact + SessionEnd hooks for auto-ingest, "
+             "plus a PostToolUse hook that re-indexes after edits",
     )
     p_hooks.add_argument(
         "--user",
@@ -1137,6 +1139,19 @@ def _filter_decision_hits(hits, max_dist: float):
     return [(d, dist) for (d, dist) in hits if dist <= max_dist]
 
 
+def _drop_superseded(hits, dead: set[int]):
+    """Remove hits whose row has been superseded by a newer one.
+
+    Kept separate from :func:`_filter_decision_hits` on purpose: that one is a
+    pure distance gate with no DB dependency and is pinned by tests. The ask
+    preface is auto-injected into every answer and shows only
+    ``config.ASK_DECISION_TOP_K`` rows, so a dead row there does real damage
+    twice over — it presents stale guidance as authoritative AND evicts live
+    context from a scarce slot.
+    """
+    return [(d, dist) for (d, dist) in hits if d.id not in dead]
+
+
 def _print_ask_decisions(hits) -> None:
     """Print a compact preface of prior decisions/facts relevant to an ``ask`` query.
 
@@ -1363,6 +1378,10 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             )
             # Pair with None distance so the formatter handles both paths uniformly.
             entries = [(d, None) for d in plain]
+        # This command always scopes to one resolved project (no
+        # --all-projects flag here, unlike some other subcommands), so the
+        # mapping is scoped the same way search/recent above already are.
+        dead_map = decisions_mod.superseded_by(conn, project_id=proj.id)
 
     if args.format == "json":
         print(json.dumps(
@@ -1374,7 +1393,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             default=str,
         ))
     else:
-        _print_decisions(entries, full=args.full)
+        _print_decisions(entries, full=args.full, superseded=dead_map)
     return 0
 
 
@@ -1517,6 +1536,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     """Session-start brief — Phase 4 session memory."""
+    from . import decisions as decisions_mod
     from . import resume as resume_mod
 
     with db.connect() as conn:
@@ -1529,7 +1549,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             project_name=proj.name,
             project_root=proj.root_path,
         )
-    _print_resume(brief)
+        # Computed inside the conn block — the connection is closed below,
+        # before _print_resume runs.
+        dead_map = decisions_mod.superseded_by(conn, project_id=proj.id)
+    _print_resume(brief, superseded=dead_map)
     return 0
 
 
@@ -1566,12 +1589,20 @@ def _short_author(author):
     return author
 
 
-def _print_decisions(entries, full: bool = False) -> None:
+def _print_decisions(
+    entries, full: bool = False, superseded: dict[int, int] | None = None
+) -> None:
     """Pretty-print (Decision, distance|None) tuples.
 
     Compact by default (~200-char decision / ~120-char why, short author) to
     keep the mandated pre-change conflict check cheap for LLM agents; pass
     ``full=True`` (CLI: --full) for the verbatim text and full author string.
+
+    ``superseded`` is the dead-id -> replacement-id mapping from
+    :func:`knowledge.decisions.superseded_by`. It defaults to ``None`` so
+    existing call sites (the single-row echo after a patch/delete) render
+    exactly as before — a browse listing is the only place a dead row can
+    otherwise be mistaken for authoritative.
     """
     from datetime import datetime
 
@@ -1595,6 +1626,12 @@ def _print_decisions(entries, full: bool = False) -> None:
         marker = "[fact] " if d.kind == "fact" else ""
         print(f"{when}  id={d.id}{by}{dist_s}")
         print(f"  topic:    {marker}{d.topic}")
+        if superseded and d.id in superseded:
+            newer = superseded[d.id]
+            print(
+                f"  SUPERSEDED by id={newer}  — this row is out of date; "
+                f"read id={newer} instead"
+            )
         print(f"  decision: {decision_s}")
         if rationale_s:
             print(f"  why:      {rationale_s}")
@@ -1605,8 +1642,13 @@ def _print_decisions(entries, full: bool = False) -> None:
             print(f"  files:    {', '.join(d.files_touched)}")
 
 
-def _print_resume(rb) -> None:
-    """Four-block session-start brief. Plain text, token-budget-aware."""
+def _print_resume(rb, superseded: dict[int, int] | None = None) -> None:
+    """Four-block session-start brief. Plain text, token-budget-aware.
+
+    ``superseded`` is the dead-id -> replacement-id mapping from
+    :func:`knowledge.decisions.superseded_by`, defaulting to ``None`` so a
+    caller without one still renders exactly as before.
+    """
     from datetime import datetime
 
     print(f"{rb.project_name}  ({rb.project_root})")
@@ -1624,8 +1666,13 @@ def _print_resume(rb) -> None:
             when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
             by = f"  ({d.author})" if d.author else ""
             ovr = f"  [overrides id={d.supersedes}]" if d.supersedes else ""
+            dead = (
+                f"  [SUPERSEDED by id={superseded[d.id]}]"
+                if superseded and d.id in superseded
+                else ""
+            )
             marker = "[fact] " if d.kind == "fact" else ""
-            print(f"  {when}  {marker}{d.topic}{by}{ovr}")
+            print(f"  {when}  {marker}{d.topic}{by}{ovr}{dead}")
             print(f"            → {d.decision}")
 
     # 2. Touched files
@@ -1819,11 +1866,18 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 conn,
                 args.question,
                 project_id=proj.id,
-                top_k=_config.ASK_DECISION_TOP_K,
+                # Over-fetch: dead (superseded) rows are dropped below and
+                # the store has no way to express that filter itself, so ask
+                # for a wider slice to still land a full ASK_DECISION_TOP_K
+                # of LIVE rows after the drop.
+                top_k=_config.ASK_DECISION_TOP_K * 2,
             )
             dec_hits = _filter_decision_hits(
                 dec_hits, _config.ASK_DECISION_MAX_DISTANCE
             )
+            dead = decisions_mod.superseded_ids(conn, project_id=proj.id)
+            dec_hits = _drop_superseded(dec_hits, dead)
+            dec_hits = dec_hits[: _config.ASK_DECISION_TOP_K]
             _print_ask_decisions(dec_hits)
 
     kept, omitted = hybrid_search.truncate_to_budget(results, args.budget)
@@ -2555,8 +2609,64 @@ _SKILL_DISPATCH = {
 }
 
 
+class _HookSpec(NamedTuple):
+    """One hook registration unit for `knowledge install-hooks`.
+
+    events: settings.json hook events this spec's command is registered
+        under, e.g. ("Stop", "PreCompact", "SessionEnd").
+    args: subcommand + flags appended after the resolved ``knowledge``
+        binary (bare or absolute) — e.g. "history ingest".
+    signature: the token that identifies an already-installed command of
+        this spec regardless of bare/absolute resolution. Matched via
+        ``_matches_hook_signature`` rather than a literal suffix check,
+        since spec B's command has a shell-safety tail after it.
+    matcher: PostToolUse-style tool matcher, or None for events that fire
+        unconditionally (Stop/PreCompact/SessionEnd take no matcher).
+    """
+
+    events: tuple[str, ...]
+    args: str
+    signature: str
+    matcher: str | None
+
+
+_HOOK_SPECS: tuple[_HookSpec, ...] = (
+    # Stop fires after every assistant turn → SQLite gets each turn's staged
+    # entries while the session is still live. PreCompact + SessionEnd are
+    # the safety net for anything written after the last Stop, or for
+    # abrupt terminations where SessionEnd may still land before the
+    # process dies.
+    _HookSpec(
+        events=("Stop", "PreCompact", "SessionEnd"),
+        args="history ingest",
+        signature="knowledge history ingest",
+        matcher=None,
+    ),
+    # PostToolUse fires after every matching tool call → the index gets
+    # incrementally re-embedded right after the edit that made it stale,
+    # instead of drifting until someone remembers `knowledge update` (repos
+    # without this hook measured days-to-weeks stale — see decision
+    # id=408). The redirect + `|| true` tail is required *because* this
+    # fires on every Write/Edit/NotebookEdit: it must stay silent (no
+    # stdout/stderr noise mid-conversation) and must never fail the tool
+    # call itself, e.g. in a repo that has no index yet.
+    _HookSpec(
+        events=("PostToolUse",),
+        args="update >/dev/null 2>&1 || true",
+        signature="knowledge update",
+        matcher="Write|Edit|NotebookEdit",
+    ),
+)
+
+
 def cmd_install_hooks(args: argparse.Namespace) -> int:
-    """Register PreCompact + SessionEnd hooks that auto-flush staged history."""
+    """Register hooks for auto-flushed history and auto-reindexing.
+
+    Two jobs, one settings.json write: flush staged history on
+    Stop/PreCompact/SessionEnd (`knowledge history ingest`), and re-index
+    after edits on PostToolUse (`knowledge update`) so `ask`/`find`/`grep`
+    don't keep answering from stale, pre-edit chunks.
+    """
     if args.user:
         settings_path = Path.home() / ".claude" / "settings.json"
         scope = "user"
@@ -2591,36 +2701,45 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
         )
         return 1
 
-    hook_cmd = _resolve_hook_command(absolute=args.absolute)
-    # Stop fires after every assistant turn → SQLite gets each turn's staged
-    # entries while the session is still live. PreCompact + SessionEnd are
-    # the safety net for anything written after the last Stop, or for
-    # abrupt terminations where SessionEnd may still land before the
-    # process dies.
-    events = ("Stop", "PreCompact", "SessionEnd")
     added: list[str] = []
     already: list[str] = []
     upgraded: list[str] = []
+    commands: list[tuple[tuple[str, ...], str]] = []
 
-    for event in events:
-        event_list = hooks.setdefault(event, [])
-        if not isinstance(event_list, list):
-            print(
-                f"error: hooks.{event} in {settings_path} is not an array",
-                file=sys.stderr,
-            )
-            return 1
-        existing_cmd = _find_history_ingest_command(event_list)
-        if existing_cmd == hook_cmd:
-            already.append(event)
-        elif existing_cmd is not None:
-            _replace_history_ingest_command(event_list, hook_cmd)
-            upgraded.append(f"{event} ({existing_cmd} → {hook_cmd})")
-        else:
-            event_list.append(
-                {"hooks": [{"type": "command", "command": hook_cmd}]}
-            )
-            added.append(event)
+    for spec in _HOOK_SPECS:
+        hook_cmd = _resolve_hook_command(absolute=args.absolute, args=spec.args)
+        commands.append((spec.events, hook_cmd))
+
+        for event in spec.events:
+            event_list = hooks.setdefault(event, [])
+            if not isinstance(event_list, list):
+                print(
+                    f"error: hooks.{event} in {settings_path} is not an array",
+                    file=sys.stderr,
+                )
+                return 1
+            existing_cmd = _find_hook_command(event_list, spec.signature)
+            if existing_cmd == hook_cmd:
+                already.append(event)
+            elif existing_cmd is not None:
+                # Signature matched but the command string differs (bare↔
+                # absolute, or an older release's args) — upgrade in place.
+                # If the user registered it under a different matcher than
+                # spec.matcher, leave THEIR matcher alone (they may have
+                # deliberately narrowed it); only the command string here
+                # is ever rewritten.
+                _replace_hook_command(event_list, spec.signature, hook_cmd)
+                upgraded.append(f"{event} ({existing_cmd} → {hook_cmd})")
+            else:
+                if spec.matcher is not None:
+                    entry = {
+                        "matcher": spec.matcher,
+                        "hooks": [{"type": "command", "command": hook_cmd}],
+                    }
+                else:
+                    entry = {"hooks": [{"type": "command", "command": hook_cmd}]}
+                event_list.append(entry)
+                added.append(event)
 
     if added or upgraded:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2629,7 +2748,8 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
         )
 
     print(f"scope: {scope}  ({settings_path})")
-    print(f"command: {hook_cmd}")
+    for events, hook_cmd in commands:
+        print(f"command ({'/'.join(events)}): {hook_cmd}")
     if added:
         print(f"added hook for: {', '.join(added)}")
     if upgraded:
@@ -2646,13 +2766,14 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
     )
     print("  2. run /compact (or let auto-compact fire)")
     print("  3. `knowledge history recent --limit 1` — the entry should be there")
+    print(
+        "  4. edit a file, then `knowledge status --json` should report "
+        "\"fresh\" (the PostToolUse hook re-indexed it)"
+    )
     return 0
 
 
-_HOOK_CMD_SUFFIX = "knowledge history ingest"
-
-
-def _resolve_hook_command(absolute: bool) -> str:
+def _resolve_hook_command(absolute: bool, args: str) -> str:
     """Return the shell command string written into settings.json.
 
     Defaults to the ABSOLUTE path of the ``knowledge`` binary (M1). Writing a
@@ -2661,8 +2782,9 @@ def _resolve_hook_command(absolute: bool) -> str:
     venv ``bin/``, a project-local ``./knowledge``) would run on every Claude
     Code interaction. ``--no-absolute`` opts back into the bare command.
     """
+    bare = f"knowledge {args}"
     if not absolute:
-        return _HOOK_CMD_SUFFIX
+        return bare
     import shutil
     resolved = shutil.which("knowledge")
     if resolved is None:
@@ -2672,7 +2794,7 @@ def _resolve_hook_command(absolute: bool) -> str:
             "--no-absolute deliberately.",
             file=sys.stderr,
         )
-        return _HOOK_CMD_SUFFIX
+        return bare
     # Surface (don't block) when the resolved binary lives somewhere that could
     # itself be attacker-influenced — a virtualenv or a path under cwd.
     markers = ("/.venv/", "/venv/", "/site-packages/", "/node_modules/")
@@ -2682,19 +2804,33 @@ def _resolve_hook_command(absolute: bool) -> str:
             "(it sits inside a virtualenv or the current project tree).",
             file=sys.stderr,
         )
-    return f"{resolved} history ingest"
+    return f"{resolved} {args}"
 
 
-def _is_history_ingest_cmd(cmd: str) -> bool:
-    """Loose match: treat any command ending in 'knowledge history ingest'
-    as ours, so upgrading bare→absolute (or vice-versa) replaces in place
-    instead of duplicating.
+def _matches_hook_signature(cmd: str, signature: str) -> bool:
+    """True when *cmd* invokes our hook verb.
+
+    Substring rather than ``endswith`` because the re-index command carries a
+    ``>/dev/null 2>&1 || true`` tail. Both boundaries are checked so
+    ``my-knowledge update-db`` is not mistaken for ours: what precedes must be
+    nothing, whitespace or a path separator, and what follows must be nothing
+    or whitespace.
     """
-    return cmd.endswith(_HOOK_CMD_SUFFIX)
+    start = 0
+    while True:
+        idx = cmd.find(signature, start)
+        if idx == -1:
+            return False
+        before = cmd[idx - 1] if idx > 0 else ""
+        after_pos = idx + len(signature)
+        after = cmd[after_pos] if after_pos < len(cmd) else ""
+        if before in ("", " ", "\t", "/") and after in ("", " ", "\t"):
+            return True
+        start = idx + 1
 
 
-def _find_history_ingest_command(event_list: list) -> str | None:
-    """Return the existing ingest-command string if present, else None."""
+def _find_hook_command(event_list: list, signature: str) -> str | None:
+    """Return the existing command string matching *signature*, else None."""
     for matcher in event_list:
         if not isinstance(matcher, dict):
             continue
@@ -2705,13 +2841,13 @@ def _find_history_ingest_command(event_list: list) -> str | None:
             if not isinstance(h, dict):
                 continue
             cmd = h.get("command")
-            if isinstance(cmd, str) and _is_history_ingest_cmd(cmd):
+            if isinstance(cmd, str) and _matches_hook_signature(cmd, signature):
                 return cmd
     return None
 
 
-def _replace_history_ingest_command(event_list: list, new_cmd: str) -> None:
-    """Rewrite the first matching ingest command in-place."""
+def _replace_hook_command(event_list: list, signature: str, new_cmd: str) -> None:
+    """Rewrite the first matching command in-place."""
     for matcher in event_list:
         if not isinstance(matcher, dict):
             continue
@@ -2722,7 +2858,7 @@ def _replace_history_ingest_command(event_list: list, new_cmd: str) -> None:
             if not isinstance(h, dict):
                 continue
             cmd = h.get("command")
-            if isinstance(cmd, str) and _is_history_ingest_cmd(cmd):
+            if isinstance(cmd, str) and _matches_hook_signature(cmd, signature):
                 h["command"] = new_cmd
                 return
 

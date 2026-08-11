@@ -290,6 +290,55 @@ def referencing(conn: Connection, decision_id: int) -> list[Decision]:
     return [_row_to_decision(r) for r in rows]
 
 
+def superseded_by(
+    conn: Connection, project_id: int | None = None
+) -> dict[int, int]:
+    """Map dead id -> the id of the NEWEST row that supersedes it.
+
+    ``superseded_ids`` answers "is this row dead?"; render paths also need
+    "dead in favour of what?" so they can point a reader at the replacement.
+    Ordering by ``created_at`` and letting later rows overwrite earlier ones
+    means a row superseded twice resolves to the most recent replacement, not
+    an intermediate one.
+
+    ``supersedes`` has no FK on either backend and older rows may store an
+    empty string rather than NULL, so both are filtered out.
+    """
+    where = "supersedes IS NOT NULL AND supersedes <> ''"
+    params: list = []
+    if project_id is not None:
+        where += " AND project_id = ?"
+        params.append(project_id)
+    rows = db.fetch_all(
+        conn,
+        f"SELECT id, supersedes FROM decisions WHERE {where} "
+        f"ORDER BY created_at ASC",
+        tuple(params),
+    )
+    mapping: dict[int, int] = {}
+    for row in rows:
+        try:
+            mapping[int(row[1])] = int(row[0])
+        except (TypeError, ValueError):
+            continue
+    return mapping
+
+
+def superseded_ids(
+    conn: Connection, project_id: int | None = None
+) -> set[int]:
+    """Ids that some NEWER row supersedes — i.e. the dead rows.
+
+    The forward pointer lives on the newer row (``supersedes``), so "has this
+    row been superseded?" is only answerable by scanning for rows that point
+    AT it. :func:`referencing` answers that for one id; this answers it
+    set-wise for a whole request, which is what the retrieval and render
+    paths need. Thin wrapper over :func:`superseded_by` so there is one query
+    and one source of truth for "dead or alive".
+    """
+    return set(superseded_by(conn, project_id))
+
+
 def exact_topic_match(
     conn: Connection, project_id: int, topic: str
 ) -> Decision | None:
@@ -384,7 +433,6 @@ def search(
     facts too.
     """
     q_vec = get_embedder().encode([query])[0]
-    k_fetch = top_k * 3 if project_id is not None else top_k
     cols_prefixed = ", ".join("d." + c for c in _SELECT_COLS.split(", "))
 
     if db.current_mode() == "postgresql":
@@ -415,26 +463,40 @@ def search(
             rows = cur.fetchall()
         return [(_row_to_decision(r[:-1]), float(r[-1])) for r in rows]
 
-    # SQLite path — sqlite-vec virtual table.
-    where_clauses = []
-    params = [q_vec.tobytes(), k_fetch]
+    # SQLite path — sqlite-vec virtual table. ``k = ?`` inside a vec0 MATCH
+    # is a HARD pre-limit resolved BEFORE any joined WHERE runs, so filtering
+    # project_id/kind only in the WHERE (the old approach) silently returns
+    # fewer than top_k rows for scoped queries — often zero. Instead we
+    # prefilter with an ``IN (subquery)`` on the vec table's declared PK
+    # column (``decision_id`` — NOT ``v.rowid``, which does not exist on
+    # this virtual table) so the KNN itself only considers matching rows.
+    # With a prefilter, k is exact and needs no over-fetch multiplier.
+    filter_where: list[str] = []
+    filter_params: list = []
     if project_id is not None:
-        where_clauses.append("d.project_id = ?")
-        params.append(project_id)
+        filter_where.append("project_id = ?")
+        filter_params.append(project_id)
     if kind:
-        where_clauses.append("d.kind = ?")
-        params.append(kind)
-    extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
+        filter_where.append("kind = ?")
+        filter_params.append(kind)
+    if filter_where:
+        prefilter = (
+            "AND v.decision_id IN (SELECT id FROM decisions WHERE "
+            + " AND ".join(filter_where)
+            + ")"
+        )
+    else:
+        prefilter = ""
     sql = f"""
         SELECT {cols_prefixed}, v.distance
         FROM decisions_vec v
         JOIN decisions d ON d.id = v.decision_id
         WHERE v.embedding MATCH ? AND k = ?
-        {extra_where}
+        {prefilter}
         ORDER BY v.distance ASC
         LIMIT ?
     """
-    params.append(top_k)
+    params = [q_vec.tobytes(), top_k, *filter_params, top_k]
     rows = conn.execute(sql, params).fetchall()
     return [(_row_to_decision(r[:-1]), float(r[-1])) for r in rows]
 

@@ -77,6 +77,12 @@ def ask(
     default; the cache then just keys on ``0.0``, which still round-trips
     correctly but won't detect a stale index the way ``cmd_ask`` does.
     """
+    # This over-fetch is unrelated to search.py's KNN prefilter fix — the
+    # prefilter makes `k` exact for the *filtered* candidate set, but here
+    # we still want a wider pool than top_k to feed the RRF merge + rerank
+    # stages (more overlap between the vec/FTS lists and more candidates
+    # for the rerank boosts to reorder). Don't "clean this up" thinking
+    # it's now redundant; it isn't.
     fetch_k = max(top_k * _OVER_FETCH, 30)
 
     # Cache lookup (pre-rerank) — LOCAL file, no main-DB round trip. This

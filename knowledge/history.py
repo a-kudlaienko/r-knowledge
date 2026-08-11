@@ -127,11 +127,12 @@ def search(
     """Semantic search over ``short_summary``. Returns ``(entry, distance)``
     tuples ordered by ascending distance.
 
-    Mirrors ``search.search``'s over-fetch-and-filter pattern so project
-    scoping doesn't silently return a too-short list.
+    On SQLite, ``project_id`` is applied as a prefilter INSIDE the vec0 KNN
+    (an ``IN (subquery)`` on the vec table's declared PK column) rather than
+    in the joined WHERE, so scoping never silently truncates the result —
+    see :func:`decisions.search` for the full rationale.
     """
     q_vec = get_embedder().encode([query])[0]
-    k_fetch = top_k * 3 if project_id is not None else top_k
 
     if db.current_mode() == "postgresql":
         where_clauses: list[str] = []
@@ -159,24 +160,31 @@ def search(
             rows = cur.fetchall()
         return [(_row_to_entry(r[:-1]), float(r[-1])) for r in rows]
 
-    # SQLite path — sqlite-vec virtual table.
-    where_clauses = []
-    params = [q_vec.tobytes(), k_fetch]
+    # SQLite path — sqlite-vec virtual table. ``k = ?`` inside a vec0 MATCH
+    # is a HARD pre-limit resolved BEFORE any joined WHERE runs, so filtering
+    # project_id only in the WHERE (the old approach) silently returns fewer
+    # than top_k rows for scoped queries — often zero. Instead we prefilter
+    # with an ``IN (subquery)`` on the vec table's declared PK column
+    # (``history_id`` — NOT ``v.rowid``, which does not exist on this virtual
+    # table) so the KNN itself only considers matching rows. With a
+    # prefilter, k is exact and needs no over-fetch multiplier.
     if project_id is not None:
-        where_clauses.append("h.project_id = ?")
-        params.append(project_id)
-    extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
+        prefilter = "AND v.history_id IN (SELECT id FROM history WHERE project_id = ?)"
+        filter_params = [project_id]
+    else:
+        prefilter = ""
+        filter_params = []
     cols = ", ".join("h." + c for c in _SELECT_COLS.split(", "))
     sql = f"""
         SELECT {cols}, v.distance
         FROM history_vec v
         JOIN history h ON h.id = v.history_id
         WHERE v.embedding MATCH ? AND k = ?
-        {extra_where}
+        {prefilter}
         ORDER BY v.distance ASC
         LIMIT ?
     """
-    params.append(top_k)
+    params = [q_vec.tobytes(), top_k, *filter_params, top_k]
     rows = conn.execute(sql, params).fetchall()
     return [(_row_to_entry(r[:-1]), float(r[-1])) for r in rows]
 
