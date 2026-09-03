@@ -82,8 +82,8 @@ Then a **verdict** in 2-4 sentences:
 
 ## Example
 
-User: `/knowledge-bench how does the karmada cert regeneration work`
+User: `/knowledge-bench how does the TLS cert regeneration work`
 
-- **Pass A**: `Grep karmada`, `Glob ansible/roles/karmada/**`, `Read ansible/roles/karmada/tasks/main.yml`, `Read ansible/roles/karmada/tasks/regenerate_certs.yml`, answer referencing those two files. ~5 tool calls.
-- **Pass B**: `knowledge status`, `knowledge search "ansible task: karmada cert regeneration" --kind ansible_task --top-k 5`, Read regenerate_certs.yml once, answer referencing the same two files. ~3 tool calls.
+- **Pass A**: `Grep webapp`, `Glob ansible/roles/webapp/**`, `Read ansible/roles/webapp/tasks/main.yml`, `Read ansible/roles/webapp/tasks/regenerate_certs.yml`, answer referencing those two files. ~5 tool calls.
+- **Pass B**: `knowledge status`, `knowledge search "ansible task: TLS cert regeneration" --kind ansible_task --top-k 5`, Read regenerate_certs.yml once, answer referencing the same two files. ~3 tool calls.
 - **Verdict**: Both found the right file. Pass B got there in 3 calls vs 5 and gave exact chunk IDs (so follow-up `knowledge get <id> --raw` is available). For well-known ansible tasks, the difference is marginal. For Python functions in a big codebase, the gap would be larger.

@@ -203,7 +203,7 @@ RRF merge of vec + FTS, reranked by last-30d git, current session stage, and imp
 ### `why <path>` — one-file brief
 
 ```bash
-knowledge why ansible/roles/karmada/tasks/main.yml
+knowledge why ansible/roles/webapp/tasks/main.yml
 knowledge why python_packages/kickstart/utils.py
 ```
 
@@ -362,19 +362,20 @@ knowledge path <chunk_id>                      # file_path:start_line-end_line
 - **Don't commit the DB** — `~/.knowledge/index.sqlite` is per-machine. Each teammate rebuilds locally.
 - **`.gitignore` is honored.** Secret-shaped files (`.env`, `*.pem`, etc.) that are gitignored are never scanned. Regex + structured-key sanitization scrub the rest. Any `CHANGE_ME` token in search results is either a user placeholder or a sanitizer replacement — never a real leaked secret.
 - **Version drift → rebuild.** If the tool's chunker or embedding model was bumped, `update` auto-falls-back to `build` and warns you. Other projects in the shared DB need their own `build` too.
+- **Index looks wrong, or a verb misbehaves?** Run `knowledge doctor` first — read-only, 7 checks (backend, schema, freshness, model cache, hooks, HEAD coherence, counts) — before deeper debugging.
 - **`.knowledgeignore`** in the repo root takes gitignore-style patterns for extra exclusions (e.g., generated docs) without polluting `.gitignore`.
-- **Failures are structured — branch on the exit code, don't parse prose.** A failed verb prints `error: <what>` plus `try: <command>` on stderr, or one JSON line `{"ok":false,"code","message","remedy","exit"}` on stdout when you passed `--json` / `--format json`. Codes: `0` ok · `1` general or `status` stale · `2` usage/missing · `3` busy · `4` shared DB unreachable · `70` internal bug. Never a raw traceback; set `KNOWLEDGE_TRACEBACK=1` if you actually want one. Full table: `docs/exit-codes.md`.
+- **Failures are structured — branch on the exit code, don't parse prose.** A failed verb prints `error: <what>` plus `try: <command>` on stderr, or one JSON line `{"ok":false,"code","message","remedy","exit"}` on stdout when you passed `--json` / `--format json`. Codes: `0` ok · `1` general or `status` stale · `2` usage/missing · `3` busy · `4` shared DB unreachable · `5` gate conflict (advisory, non-blocking) · `70` internal bug. Never a raw traceback; set `KNOWLEDGE_TRACEBACK=1` if you actually want one. Full table: `docs/exit-codes.md`.
 
 ## Example end-to-end
 
-User: "how does the karmada cert regeneration ansible task work"
+User: "how does the TLS cert regeneration ansible task work"
 
 1. New session → `knowledge status --json` → `knowledge update` if `stale` → `knowledge resume`.
-2. `knowledge ask "karmada cert regeneration" --kind ansible_task --top-k 5`
-3. Top result: `ansible/roles/karmada/tasks/main.yml:47-55 | ansible_task | name: Regenerate Karmada TLS certificates`
-4. `knowledge why ansible/roles/karmada/tasks/regenerate_certs.yml` for the included file's neighbors.
-5. Summarize for the user referencing `ansible/roles/karmada/tasks/main.yml:47`.
-6. If this invoked a non-obvious design choice, `knowledge decide "karmada cert rotation approach" --decision "..." --files ansible/roles/karmada/tasks/regenerate_certs.yml`.
+2. `knowledge ask "TLS cert regeneration" --kind ansible_task --top-k 5`
+3. Top result: `ansible/roles/webapp/tasks/main.yml:47-55 | ansible_task | name: Regenerate webapp TLS certificates`
+4. `knowledge why ansible/roles/webapp/tasks/regenerate_certs.yml` for the included file's neighbors.
+5. Summarize for the user referencing `ansible/roles/webapp/tasks/main.yml:47`.
+6. If this invoked a non-obvious design choice, `knowledge decide "webapp cert rotation approach" --decision "..." --files ansible/roles/webapp/tasks/regenerate_certs.yml`.
 
 ## Continuity / memory — cross-session RAG over past work
 

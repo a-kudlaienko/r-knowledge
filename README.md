@@ -379,7 +379,7 @@ knowledge find VaultClient --exact
 knowledge grep 'vault AND approle'
 
 # Orient before reading
-knowledge why ansible/roles/karmada/tasks/main.yml
+knowledge why ansible/roles/webapp/tasks/main.yml
 knowledge map --dir terraform --depth 3
 knowledge brief
 

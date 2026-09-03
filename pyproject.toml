@@ -44,7 +44,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov"]
+dev = ["pytest>=8", "pytest-cov", "pre-commit"]
 # Shared PostgreSQL backend (storage.mode = "shared_postgresql"). Optional;
 # the default sqlite path needs none of these. psycopg[binary] ships wheels
 # for macOS/Linux so users don't need libpq dev headers.
