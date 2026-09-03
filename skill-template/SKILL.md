@@ -363,6 +363,7 @@ knowledge path <chunk_id>                      # file_path:start_line-end_line
 - **`.gitignore` is honored.** Secret-shaped files (`.env`, `*.pem`, etc.) that are gitignored are never scanned. Regex + structured-key sanitization scrub the rest. Any `CHANGE_ME` token in search results is either a user placeholder or a sanitizer replacement — never a real leaked secret.
 - **Version drift → rebuild.** If the tool's chunker or embedding model was bumped, `update` auto-falls-back to `build` and warns you. Other projects in the shared DB need their own `build` too.
 - **`.knowledgeignore`** in the repo root takes gitignore-style patterns for extra exclusions (e.g., generated docs) without polluting `.gitignore`.
+- **Failures are structured — branch on the exit code, don't parse prose.** A failed verb prints `error: <what>` plus `try: <command>` on stderr, or one JSON line `{"ok":false,"code","message","remedy","exit"}` on stdout when you passed `--json` / `--format json`. Codes: `0` ok · `1` general or `status` stale · `2` usage/missing · `3` busy · `4` shared DB unreachable · `70` internal bug. Never a raw traceback; set `KNOWLEDGE_TRACEBACK=1` if you actually want one. Full table: `docs/exit-codes.md`.
 
 ## Example end-to-end
 

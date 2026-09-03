@@ -119,3 +119,12 @@ ASK_DECISION_MAX_DISTANCE = 0.92
 # this many seconds past last_update, the project is "stale". Zero means
 # strict equality — any modification makes it stale.
 STALE_GRACE_SECONDS = 1.0
+
+# `knowledge gate` pre-change conflict check: how many decisions/facts or
+# history entries to consider per semantic signal.
+GATE_TOP_K = 5
+# Maximum semantic distance for a gate hit to count as relevant. Defaulted to
+# the same calibrated value as ASK_DECISION_MAX_DISTANCE — both answer "is
+# this actually on-topic?" against the same embedder, so there is no reason
+# for a second, separately-tuned threshold.
+GATE_MAX_DISTANCE = ASK_DECISION_MAX_DISTANCE

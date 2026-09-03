@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -61,6 +62,49 @@ _REQUIRED_PGVECTOR_TYPES = ("vector", "bit")
 # tools using advisory locks on the same database are extremely unlikely
 # while still fitting in the 32-bit lock-key first slot.
 _LOCK_NAMESPACE = 0x6B6E6F77
+
+# Bounded retry for transient PG *read* paths (connect + SELECT). Writes
+# already have a durable fallback — ``knowledge/outbox.py`` buffers a failed
+# user-authored write locally and replays it later — but a read (`ask`,
+# `find`, `resume`, ...) had nothing: one dropped connection meant a hard
+# failure straight to exit 4. Capped at 2 total attempts (1 retry), which
+# mirrors Stripe's published retry guidance: enough to ride out a blip
+# without turning a genuinely dead database into a long hang.
+_READ_RETRY_ATTEMPTS = 2
+_READ_RETRY_BACKOFF_SECONDS = 0.15
+
+
+def with_read_retry(
+    fn, error_types: tuple[type[BaseException], ...]
+):
+    """Call ``fn()``, retrying once more if it raises one of ``error_types``.
+
+    Total attempts are capped at :data:`_READ_RETRY_ATTEMPTS` (2 — one
+    retry), with a short sleep between attempts.
+
+    ``error_types`` must be exactly what
+    :meth:`PostgresBackend.connection_error_types` returns — the transient
+    "the connection is gone" errors (``psycopg.OperationalError``,
+    ``psycopg.InterfaceError``), never a query/syntax/constraint error.
+    Those are deterministic; retrying one just adds latency for the same
+    failure. On SQLite (or whenever psycopg isn't resolvable)
+    ``connection_error_types()`` is ``()``, so ``except error_types`` matches
+    nothing and this degrades to a single, unretried call on the first
+    exception — structurally inert there, not merely unlikely to fire.
+
+    Callers MUST only pass a read-only ``fn``. This helper cannot tell
+    whether ``fn`` mutates data, so wrapping a write here would risk
+    double-applying it on retry — writes must keep going through the
+    existing ``except db.offline_errors():`` → outbox path, untouched by
+    this helper.
+    """
+    for attempt in range(1, _READ_RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except error_types:
+            if attempt >= _READ_RETRY_ATTEMPTS:
+                raise
+            time.sleep(_READ_RETRY_BACKOFF_SECONDS)
 
 
 class _DependencyMissing(RuntimeError):
@@ -270,7 +314,19 @@ class PostgresBackend:
 
         # autocommit=False so caller code uses ``with backend.transaction(conn):``
         # consistently with the SQLite path.
-        conn = psycopg.connect(dsn, autocommit=False, **connect_kwargs)
+        #
+        # Retried: opening a connection has no side effect on the database
+        # itself, so a bounded retry here is safe no matter whether the
+        # caller goes on to read or write through it. A transient blip gets
+        # one extra chance before surfacing — for a read that means the
+        # exception simply propagates as before; for a write, the caller's
+        # own ``except db.offline_errors():`` still buffers to the outbox
+        # exactly as today. The write STATEMENT itself is never retried by
+        # this call — only the connection attempt that precedes it.
+        conn = with_read_retry(
+            lambda: psycopg.connect(dsn, autocommit=False, **connect_kwargs),
+            self.connection_error_types(),
+        )
 
         host = conninfo.get("host") or ""
         port = int(conninfo.get("port") or 5432)

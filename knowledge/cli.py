@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import warnings
@@ -24,6 +25,8 @@ warnings.filterwarnings(
 )
 
 from . import db, paths, projects
+from .jsonout import KnowledgeError, emit, error_payload, wants_json
+from .sanitizer import scrub_text
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -137,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_why.add_argument("path", help="File path (repo-relative, absolute, or cwd-relative)")
     p_why.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_why.add_argument("--format", choices=("text", "json"), default="text")
 
     # map — directory tree with per-dir aggregates.
     p_map = sub.add_parser(
@@ -150,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_map.add_argument("--depth", type=int, default=2, help="Group by first N path components (default 2)")
     p_map.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_map.add_argument("--format", choices=("text", "json"), default="text")
 
     # brief — repo-level snapshot.
     p_brief = sub.add_parser(
@@ -157,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Repo-wide summary: totals, top langs, hub files.",
     )
     p_brief.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_brief.add_argument("--format", choices=("text", "json"), default="text")
 
     # decide — record a non-obvious choice (Phase 4 session memory).
     p_decide = sub.add_parser(
@@ -296,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         help='"Where did I leave off?" — decisions + touched files + pending stage + hubs.',
     )
     p_resume.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_resume.add_argument("--format", choices=("text", "json"), default="text")
 
     # consolidate — recurring-theme gap report (read-only).
     p_consol = sub.add_parser(
@@ -324,10 +331,12 @@ def main(argv: list[str] | None = None) -> int:
     p_get.add_argument("chunk_id", type=int)
     p_get.add_argument("--with-siblings", action="store_true")
     p_get.add_argument("--raw", action="store_true", help="Re-slice original bytes from disk")
+    p_get.add_argument("--format", choices=("text", "json"), default="text")
 
     # path
     p_path = sub.add_parser("path", help="Print file_path:start_line-end_line for a chunk")
     p_path.add_argument("chunk_id", type=int)
+    p_path.add_argument("--format", choices=("text", "json"), default="text")
 
     # projects
     p_projects = sub.add_parser("projects", help="List registered projects")
@@ -339,10 +348,12 @@ def main(argv: list[str] | None = None) -> int:
              "projects you haven't migrated yet, or for verifying a "
              "post-migrate forget --sqlite-only worked.",
     )
+    p_projects.add_argument("--format", choices=("text", "json"), default="text")
 
     # stats
     p_stats = sub.add_parser("stats", help="DB + project statistics")
     p_stats.add_argument("--project", help="Scope stats to one project")
+    p_stats.add_argument("--format", choices=("text", "json"), default="text")
 
     # forget
     p_forget = sub.add_parser("forget", help="Delete a project and all its chunks")
@@ -742,6 +753,52 @@ def main(argv: list[str] | None = None) -> int:
         "PATH hijacking and GUI-launch PATH quirks). Use --no-absolute to write "
         "the bare 'knowledge' command instead.",
     )
+    p_hooks.add_argument(
+        "--with-gate",
+        action="store_true",
+        help="Also register a PreToolUse hook that runs `knowledge gate --hook` "
+             "before Write/Edit/NotebookEdit calls. Purely advisory: on a "
+             "conflict it injects additionalContext for the model to read, and "
+             "it can never block the tool call (see docs/exit-codes.md). Off by "
+             "default — existing installs are unaffected unless you pass this "
+             "explicitly.",
+    )
+
+    # doctor
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Read-only health report: backend, schema, freshness, embedding "
+             "model, hooks, git/HEAD coherence, counts",
+    )
+    p_doctor.add_argument("--project", help="Scope project-specific checks to this project")
+    p_doctor.add_argument("--format", choices=("text", "json"), default="text")
+
+    # gate — pre-change conflict sensor (see knowledge/gate.py).
+    p_gate = sub.add_parser(
+        "gate",
+        help="Pre-change conflict check: prior decisions/facts/history/coupling "
+             "bearing on a topic or file set. Read-only and advisory — never "
+             "writes, never blocks; exit 5 signals 'read before proceeding'.",
+    )
+    p_gate.add_argument("--topic", help="Free-text topic to check against prior decisions/history")
+    p_gate.add_argument(
+        "--files",
+        nargs="+",
+        help="File path(s) to check for exact files_touched matches and import coupling",
+    )
+    p_gate.add_argument("--project", help="Scope to a specific project (name or abs path)")
+    p_gate.add_argument("--format", choices=("text", "json"), default="text")
+    p_gate.add_argument(
+        "--hook",
+        action="store_true",
+        help="PreToolUse hook mode: read the tool-call event JSON from stdin "
+             "(Claude Code's own hook contract), extract file_path / "
+             "notebook_path / path, and run gate for that one file. Emits "
+             "hookSpecificOutput.additionalContext JSON on conflict, nothing "
+             "on clear, and always exits 0 — never permissionDecision, never "
+             "blocking. Mutually exclusive with --format: --hook takes "
+             "precedence when both are given.",
+    )
 
     args = parser.parse_args(argv)
     try:
@@ -751,6 +808,9 @@ def main(argv: list[str] | None = None) -> int:
         # decisions/…): they need the shared DB and can't be served offline.
         # Write commands handle this themselves by buffering to the outbox,
         # so they won't reach here. Clean message instead of a raw traceback.
+        # Load-bearing: byte-identical to the pre-Phase-1a message, and this
+        # clause is checked BEFORE `except Exception` below so an offline DB
+        # never gets relabeled as an "internal error" (`knowledge decide`).
         print(
             "error: shared index unreachable (PostgreSQL is down or "
             "unconfigured). Reads need the DB; any writes are buffered locally "
@@ -758,6 +818,54 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 4
+    except KnowledgeError as exc:
+        # A `cmd_*` handler raised a deliberate, machine-actionable error
+        # (see knowledge/jsonout.py). Render it per the invoked verb's own
+        # machine-readable-output request — `wants_json` covers both the
+        # `--json` and `--format json` conventions that coexist across verbs.
+        #
+        # `exc.message` can itself carry a secret: several `cmd_*` handlers
+        # (and `settings.py`, which they call into) interpolate raw config
+        # values with `!r` into their error text — e.g. `storage.mode must
+        # be 'sqlite' or 'shared_postgresql' (got {mode!r})` — so a mis-pasted
+        # PostgreSQL DSN (user:pass@host) lands verbatim in this string. Scrub
+        # before it reaches stdout JSON or stderr prose, both of which are
+        # routinely captured into an agent transcript. `exc.remedy` is
+        # normally a fixed command string, but scrub it too since nothing
+        # prevents a future caller from building one from user input.
+        message = scrub_text(exc.message)
+        remedy = scrub_text(exc.remedy) if exc.remedy is not None else None
+        if wants_json(args):
+            emit(error_payload(exc.code, message, remedy=remedy, exit_code=exc.exit_code))
+        else:
+            print(f"error: {message}", file=sys.stderr)
+            if remedy:
+                print(f"  try: {remedy}", file=sys.stderr)
+        return exc.exit_code
+    except Exception as exc:
+        # Last resort: an exception nobody anticipated. Excludes
+        # KeyboardInterrupt/SystemExit (both are BaseException, not
+        # Exception) so Ctrl-C still propagates and exits normally instead
+        # of being relabeled as an "internal error".
+        #
+        # KNOWLEDGE_TRACEBACK is the developer escape hatch — set it to get
+        # the real traceback back instead of the structured envelope below.
+        if os.environ.get("KNOWLEDGE_TRACEBACK"):
+            raise
+        # str(exc) can carry the same kind of mis-pasted secret as the
+        # KnowledgeError branch above (e.g. a `!r`-interpolated DSN or token
+        # from `settings.py`'s int()/mode/sslmode validation) — this is the
+        # catch-all for exceptions `settings.py` itself raises before a
+        # bespoke `cmd_*` handler ever gets a chance to wrap them. Scrub
+        # before it reaches stdout JSON or stderr prose.
+        detail = scrub_text(f"{type(exc).__name__}: {exc}")
+        remedy = "re-run with KNOWLEDGE_TRACEBACK=1 for a traceback"
+        if wants_json(args):
+            emit(error_payload("internal_error", detail, remedy=remedy, exit_code=70))
+        else:
+            print(f"error: internal error: {detail}", file=sys.stderr)
+            print("  set KNOWLEDGE_TRACEBACK=1 to see the traceback", file=sys.stderr)
+        return 70
 
 
 # ---------------------------------------------------------------------------
@@ -1355,9 +1463,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     from . import decisions as decisions_mod
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         if args.search_q:
             raw = decisions_mod.search(
                 conn,
@@ -1434,9 +1540,7 @@ def cmd_patch(args: argparse.Namespace) -> int:
         return 2
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
 
         # Same id-validation shape as --supersede in _decide_online: fetch
         # first so a wrong-project id gets a clean error instead of silently
@@ -1492,9 +1596,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
     from . import decisions as decisions_mod
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
 
         target = decisions_mod.get(conn, args.decision_id)
         if target is None or target.project_id != proj.id:
@@ -1540,9 +1642,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     from . import resume as resume_mod
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         brief = resume_mod.build(
             conn,
             project_id=proj.id,
@@ -1552,6 +1652,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
         # Computed inside the conn block — the connection is closed below,
         # before _print_resume runs.
         dead_map = decisions_mod.superseded_by(conn, project_id=proj.id)
+    # `getattr`, not `args.format`: tests/test_supersede_retrieval.py calls
+    # cmd_resume() with a bare Namespace(project=...) that has no `format`
+    # attribute at all, so this must default rather than raise.
+    if getattr(args, "format", "text") == "json":
+        emit(_resume_payload(brief, dead_map))
+        return 0
     _print_resume(brief, superseded=dead_map)
     return 0
 
@@ -1705,15 +1811,54 @@ def _print_resume(rb, superseded: dict[int, int] | None = None) -> None:
     )
 
 
+def _resume_payload(rb, superseded: dict[int, int] | None = None) -> dict:
+    """Build the ``knowledge resume --format json`` payload — same four
+    sections as :func:`_print_resume`, structured instead of rendered.
+
+    ``pending_stage`` is reported as a count (per the agreed shape): the
+    prose only ever shows a truncated preview, so the count is the one
+    stable, non-lossy number to expose rather than re-deriving a partial
+    list that would disagree with the text output.
+    """
+    superseded = superseded or {}
+    return {
+        "ok": True,
+        "project": rb.project_name,
+        "root": rb.project_root,
+        "totals": {
+            "history_entries": rb.total_history_entries,
+            "decisions": rb.total_decisions,
+        },
+        "recent_decisions": [
+            {
+                "id": d.id,
+                "topic": d.topic,
+                "decision": d.decision,
+                "kind": d.kind,
+                "author": d.author,
+                "created_at": d.created_at,
+                "supersedes": d.supersedes,
+                "superseded_by": superseded.get(d.id),
+            }
+            for d in rb.last_decisions
+        ],
+        "touched_files": [
+            {"path": rel, "score": score} for rel, score in rb.touched_files
+        ],
+        "pending_stage": len(rb.pending_stage),
+        "hub_files": [
+            {"path": rel, "in_degree": deg} for rel, deg in rb.hub_files
+        ],
+    }
+
+
 def cmd_consolidate(args: argparse.Namespace) -> int:
     """Recurring-theme gap report — read-only consolidation of history vs decisions."""
     import json as json_mod
     from . import consolidate as consolidate_mod
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         report = consolidate_mod.build(
             conn,
             project_id=proj.id,
@@ -1841,9 +1986,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from . import hybrid_search
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         # Cross-client cache-invalidation signal — no extra DB query, proj
         # is already fetched. See knowledge/query_cache.py module docstring.
         index_stamp = max(proj.last_build or 0, proj.last_update or 0)
@@ -1892,19 +2035,23 @@ def cmd_why(args: argparse.Namespace) -> int:
     from . import cartography
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         rel_path = _resolve_relations_target(args.path, proj.root_path)
         brief = cartography.why(conn, rel_path, proj.id, proj.root_path)
 
     if brief is None:
-        print(
-            f"error: file not indexed: {rel_path}\n"
+        # Same message the caller previously printed verbatim (embedded
+        # newline and all) so default-mode prose stays byte-identical;
+        # `remedy` stays unset rather than duplicating the "run knowledge
+        # update" guidance already folded into the message.
+        raise KnowledgeError(
+            "file_not_indexed",
+            f"file not indexed: {rel_path}\n"
             "check the path, or run 'knowledge update' if the file is new.",
-            file=sys.stderr,
         )
-        return 1
+    if getattr(args, "format", "text") == "json":
+        emit(_why_payload(brief))
+        return 0
     _print_why(brief)
     return 0
 
@@ -1914,19 +2061,20 @@ def cmd_map(args: argparse.Namespace) -> int:
     from . import cartography
 
     if args.depth < 1:
-        print("error: --depth must be >= 1", file=sys.stderr)
-        return 1
+        raise KnowledgeError("invalid_depth", "--depth must be >= 1")
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         entries, truncated = cartography.map_tree(
             conn,
             project_id=proj.id,
             dir_filter=args.dir_filter,
             depth=args.depth,
         )
+
+    if getattr(args, "format", "text") == "json":
+        emit(_map_payload(entries, proj, truncated, args.dir_filter, args.depth))
+        return 0
 
     if not entries:
         scope = f" under '{args.dir_filter}'" if args.dir_filter else ""
@@ -1941,9 +2089,7 @@ def cmd_brief(args: argparse.Namespace) -> int:
     from . import cartography
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         rb = cartography.brief(
             conn,
             project_id=proj.id,
@@ -1951,6 +2097,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
             project_root=str(proj.root_path),
             last_updated=proj.last_update,
         )
+    if getattr(args, "format", "text") == "json":
+        emit(_brief_payload(rb))
+        return 0
     _print_brief(rb)
     return 0
 
@@ -1983,6 +2132,28 @@ def _print_why(b) -> None:
         print("  (no resolved cross-file edges)")
 
 
+def _why_payload(b) -> dict:
+    """Build the ``knowledge why --format json`` payload — same data as
+    :func:`_print_why`, structured instead of rendered."""
+    return {
+        "ok": True,
+        "file": {
+            "path": b.rel_path,
+            "lang": b.lang,
+            "loc": b.loc,
+            "size_bytes": b.size,
+            "last_commit": b.last_commit_date,
+        },
+        "description": b.description,
+        "top_symbols": [
+            {"kind": kind, "name": name, "start_line": sl, "end_line": el}
+            for kind, name, sl, el, _cc in b.top_symbols
+        ],
+        "inbound": [{"path": src, "kind": kind} for src, kind in b.inbound],
+        "outbound": [{"path": tgt, "kind": kind} for tgt, kind in b.outbound],
+    }
+
+
 def _print_map(entries, proj, truncated: bool, dir_filter, depth: int) -> None:
     """Render a directory map as a fixed-width table."""
     header_dir = "DIR"
@@ -2013,6 +2184,31 @@ def _print_map(entries, proj, truncated: bool, dir_filter, depth: int) -> None:
         )
 
 
+def _map_payload(entries, proj, truncated: bool, dir_filter, depth: int) -> dict:
+    """Build the ``knowledge map --format json`` payload — same data as
+    :func:`_print_map`, structured instead of rendered. Emitted for the
+    empty-``entries`` case too (as a ``subtrees: []`` list) so json mode
+    never falls back to the "(no files indexed...)" prose line."""
+    return {
+        "ok": True,
+        "project": proj.name,
+        "root": str(proj.root_path),
+        "dir_filter": dir_filter,
+        "depth": depth,
+        "truncated": truncated,
+        "subtrees": [
+            {
+                "path": e.dir_path,
+                "files": e.file_count,
+                "dominant_lang": e.dominant_lang,
+                "top_kinds": [{"kind": k, "count": n} for k, n in e.top_kinds],
+                "entrypoint": e.entrypoint,
+            }
+            for e in entries
+        ],
+    }
+
+
 def _print_brief(rb) -> None:
     """Render a :class:`RepoBrief`."""
     from datetime import datetime
@@ -2033,6 +2229,24 @@ def _print_brief(rb) -> None:
             print(f"  {deg:>3}×  {rel}")
     else:
         print("\n(no resolved cross-file edges)")
+
+
+def _brief_payload(rb) -> dict:
+    """Build the ``knowledge brief --format json`` payload — same data as
+    :func:`_print_brief`, structured instead of rendered."""
+    return {
+        "ok": True,
+        "project": rb.project_name,
+        "root": rb.project_root,
+        "last_updated": rb.last_updated,
+        "totals": {
+            "files": rb.file_count,
+            "chunks": rb.chunk_count,
+            "edges": rb.edge_count,
+        },
+        "top_langs": [{"lang": lang, "files": n} for lang, n in rb.top_langs],
+        "hub_files": [{"path": rel, "in_degree": deg} for rel, deg in rb.hub_files],
+    }
 
 
 def _format_bytes(size: int) -> str:
@@ -2066,18 +2280,18 @@ def _contained_abs_path(project_root: str, rel_path: str) -> Path | None:
 def cmd_get(args: argparse.Namespace) -> int:
     from . import search as search_mod
 
+    want_json = getattr(args, "format", "text") == "json"
+
     with db.connect() as conn:
         if args.with_siblings:
             family = search_mod.get_family(conn, args.chunk_id)
             if not family:
-                print(f"error: no chunk with id {args.chunk_id}", file=sys.stderr)
-                return 1
-            return _emit_family(family, raw=args.raw)
+                raise KnowledgeError("chunk_not_found", f"no chunk with id {args.chunk_id}")
+            return _emit_family(family, raw=args.raw, as_json=want_json)
 
         row = search_mod.get_chunk(conn, args.chunk_id)
     if row is None:
-        print(f"error: no chunk with id {args.chunk_id}", file=sys.stderr)
-        return 1
+        raise KnowledgeError("chunk_not_found", f"no chunk with id {args.chunk_id}")
 
     (cid, kind, name, qname, sl, el, sb, eb, stored, rel_path, project_root,
      _parent_id) = row
@@ -2085,22 +2299,45 @@ def cmd_get(args: argparse.Namespace) -> int:
     if args.raw:
         abs_path = _contained_abs_path(project_root, rel_path)
         if abs_path is None:
-            print(
-                f"error: chunk path escapes project root: {rel_path!r}",
-                file=sys.stderr,
+            raise KnowledgeError(
+                "chunk_path_escapes_root",
+                f"chunk path escapes project root: {rel_path!r}",
             )
-            return 1
         try:
             with open(abs_path, "rb") as f:
                 f.seek(sb)
                 data = f.read(eb - sb)
-            sys.stdout.write(data.decode("utf-8", errors="replace"))
-            if not data.endswith(b"\n"):
-                sys.stdout.write("\n")
         except OSError as exc:
-            print(f"error: cannot read {abs_path}: {exc}", file=sys.stderr)
-            return 1
+            raise KnowledgeError(
+                "chunk_read_failed", f"cannot read {abs_path}: {exc}"
+            ) from exc
+        if want_json:
+            emit({
+                "ok": True,
+                "chunk": {
+                    "id": cid, "path": rel_path, "start_line": sl, "end_line": el,
+                    "kind": kind, "name": qname or name,
+                    "text": data.decode("utf-8", errors="replace"),
+                },
+            })
+            return 0
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        if not data.endswith(b"\n"):
+            sys.stdout.write("\n")
     else:
+        if want_json:
+            emit({
+                "ok": True,
+                "chunk": {
+                    "id": cid, "path": rel_path, "start_line": sl, "end_line": el,
+                    "kind": kind, "name": qname or name,
+                    # Mirrors `print(stored)` below exactly (no decompress) —
+                    # a JSON channel over the same bytes the prose already
+                    # shows, not a fix for that pre-existing display choice.
+                    "text": stored,
+                },
+            })
+            return 0
         header = f"chunk {cid}: {kind} {qname or name or ''} ({rel_path}:{sl}-{el})"
         print(header)
         print("-" * len(header))
@@ -2108,7 +2345,7 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _emit_family(family: list, *, raw: bool) -> int:
+def _emit_family(family: list, *, raw: bool, as_json: bool = False) -> int:
     """Render a big_parent's family (parent + ordered big_subchunks).
 
     ``family[0]`` is the parent (``ORDER BY CASE … THEN -1``). ``--raw``
@@ -2127,21 +2364,54 @@ def _emit_family(family: list, *, raw: bool) -> int:
         # reassembles exactly what was on disk at build time.
         abs_path = _contained_abs_path(project_root, rel_path)
         if abs_path is None:
-            print(
-                f"error: chunk path escapes project root: {rel_path!r}",
-                file=sys.stderr,
+            raise KnowledgeError(
+                "chunk_path_escapes_root",
+                f"chunk path escapes project root: {rel_path!r}",
             )
-            return 1
         try:
             with open(abs_path, "rb") as f:
                 f.seek(sb)
                 data = f.read(eb - sb)
-            sys.stdout.write(data.decode("utf-8", errors="replace"))
-            if not data.endswith(b"\n"):
-                sys.stdout.write("\n")
         except OSError as exc:
-            print(f"error: cannot read {abs_path}: {exc}", file=sys.stderr)
-            return 1
+            raise KnowledgeError(
+                "chunk_read_failed", f"cannot read {abs_path}: {exc}"
+            ) from exc
+        if as_json:
+            emit({
+                "ok": True,
+                "chunk": {
+                    "id": parent[0], "path": rel_path,
+                    "start_line": parent[3], "end_line": parent[4],
+                    "kind": kind, "name": name,
+                    "text": data.decode("utf-8", errors="replace"),
+                },
+            })
+            return 0
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        if not data.endswith(b"\n"):
+            sys.stdout.write("\n")
+        return 0
+
+    if as_json:
+        emit({
+            "ok": True,
+            "chunk": {
+                "id": parent[0], "path": rel_path,
+                "start_line": parent[3], "end_line": parent[4],
+                "kind": kind, "name": name,
+                "text": decompress(parent[7]),
+            },
+            "subchunks": [
+                {
+                    "id": sub[0],
+                    "start_line": sub[3],
+                    "end_line": sub[4],
+                    "sibling_order": sub[10],
+                    "text": decompress(sub[7]),
+                }
+                for sub in family[1:]
+            ],
+        })
         return 0
 
     header = f"chunk {parent[0]}: {kind} {name or ''} ({rel_path}:{parent[3]}-{parent[4]})"
@@ -2165,27 +2435,48 @@ def cmd_path(args: argparse.Namespace) -> int:
     with db.connect() as conn:
         row = search_mod.get_chunk(conn, args.chunk_id)
     if row is None:
-        print(f"error: no chunk with id {args.chunk_id}", file=sys.stderr)
-        return 1
+        raise KnowledgeError("chunk_not_found", f"no chunk with id {args.chunk_id}")
     (_cid, _kind, _name, _qname, sl, el, _sb, _eb, _stored, rel_path, project_root,
      _parent_id) = row
     abs_path = _contained_abs_path(project_root, rel_path)
     if abs_path is None:
-        print(
-            f"error: chunk path escapes project root: {rel_path!r}",
-            file=sys.stderr,
+        raise KnowledgeError(
+            "chunk_path_escapes_root",
+            f"chunk path escapes project root: {rel_path!r}",
         )
-        return 1
+    if getattr(args, "format", "text") == "json":
+        emit({
+            "ok": True,
+            "path": str(abs_path),
+            "start_line": sl,
+            "end_line": el,
+        })
+        return 0
     print(f"{abs_path}:{sl}-{el}")
     return 0
 
 
 def cmd_projects(args: argparse.Namespace) -> int:
+    want_json = getattr(args, "format", "text") == "json"
     if getattr(args, "local_sqlite", False):
-        return _cmd_projects_sqlite_only()
+        return _cmd_projects_sqlite_only(want_json=want_json)
 
     with db.connect() as conn:
         rows = projects.list_projects(conn)
+    if want_json:
+        emit({
+            "ok": True,
+            "projects": [
+                {
+                    "name": p.name,
+                    "root": str(p.root_path),
+                    "files": p.file_count,
+                    "chunks": p.chunk_count,
+                }
+                for p in rows
+            ],
+        })
+        return 0
     if not rows:
         print("No projects registered. Run `knowledge build` from a repo root.")
         return 0
@@ -2198,7 +2489,7 @@ def cmd_projects(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_projects_sqlite_only() -> int:
+def _cmd_projects_sqlite_only(want_json: bool = False) -> int:
     """List projects from local sqlite regardless of cwd resolution.
 
     Same dispatch-bypass pattern as ``forget --sqlite-only`` — opens
@@ -2216,6 +2507,18 @@ def _cmd_projects_sqlite_only() -> int:
     finally:
         conn.close()
 
+    if want_json:
+        emit({
+            "ok": True,
+            "projects": [
+                {"name": name, "root": root, "files": fc, "chunks": cc}
+                for name, root, fc, cc in rows
+            ],
+            "source": "sqlite",
+            "sqlite_path": str(paths.db_path()),
+        })
+        return 0
+
     if not rows:
         print("No projects in local sqlite.")
         return 0
@@ -2230,10 +2533,14 @@ def _cmd_projects_sqlite_only() -> int:
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
+    want_json = getattr(args, "format", "text") == "json"
     with db.connect() as conn:
         rows = projects.list_projects(conn)
         total_chunks = db.fetch_one(conn, "SELECT COUNT(*) FROM chunks")[0]
         total_files = db.fetch_one(conn, "SELECT COUNT(*) FROM files")[0]
+    # Built incrementally across the backend branches below so both the
+    # prose and the json payload share one source of truth for `backend`.
+    payload: dict = {"ok": True}
     if db.current_mode() == "postgresql":
         from . import settings as settings_mod
 
@@ -2243,11 +2550,35 @@ def cmd_stats(args: argparse.Namespace) -> int:
             f"postgresql ({pg.host}:{pg.port}/{pg.database})"
             if pg is not None else "postgresql"
         )
-        print(f"DB:          {backend_descr}")
-        print(f"config:      {s.config_source}")
+        payload["backend"] = "postgresql"
+        payload["config_source"] = s.config_source
+        if not want_json:
+            print(f"DB:          {backend_descr}")
+            print(f"config:      {s.config_source}")
     else:
-        print(f"DB:          {paths.db_path()}")
-        print(f"DB size:     {_format_size(paths.db_path())}")
+        payload["backend"] = "sqlite"
+        payload["db_path"] = str(paths.db_path())
+        payload["db_size_bytes"] = paths.db_path().stat().st_size if paths.db_path().exists() else 0
+        if not want_json:
+            print(f"DB:          {paths.db_path()}")
+            print(f"DB size:     {_format_size(paths.db_path())}")
+    payload["totals"] = {
+        "projects": len(rows),
+        "files": total_files,
+        "chunks": total_chunks,
+    }
+    payload["projects"] = [
+        {
+            "name": p.name,
+            "root": str(p.root_path),
+            "files": p.file_count,
+            "chunks": p.chunk_count,
+        }
+        for p in rows
+    ]
+    if want_json:
+        emit(payload)
+        return 0
     print(f"Projects:    {len(rows)}")
     print(f"Files:       {total_files}")
     print(f"Chunks:      {total_chunks}")
@@ -2658,6 +2989,36 @@ _HOOK_SPECS: tuple[_HookSpec, ...] = (
     ),
 )
 
+# Opt-in only (see `--with-gate`) — kept OUT of `_HOOK_SPECS` on purpose so
+# `cmd_install_hooks`'s default (no-flag) behavior is byte-identical to
+# before this spec existed. Fires PreToolUse, before the same Write/Edit/
+# NotebookEdit calls the re-index spec above fires PostToolUse after.
+#
+# `gate --hook`, NOT the earlier `jq`-based `--files "$(...)"` substitution:
+# Claude Code parses a hook's stdout ONLY when the ENTIRE output is one JSON
+# object starting with `{` and ending with `}` — plain prose is silently
+# discarded, so the old version's findings could never have reached the
+# model even without its `>/dev/null` redirect, and it also depended on `jq`
+# being installed. `--hook` mode reads the PreToolUse event JSON directly
+# off its OWN stdin (Claude Code feeds this to every hook) — see
+# `_cmd_gate_hook` — so there is no `jq` dependency and no shell quoting of
+# `.tool_input.file_path`. Its only output channel is the advisory
+# `hookSpecificOutput.additionalContext` field (built by `_gate_hook_context`)
+# and it deliberately NEVER emits `permissionDecision`/`decision` — those are
+# what would let a hook block or auto-approve the tool call even at exit 0.
+# `--hook` mode also always exits 0 itself (see docs/exit-codes.md's note on
+# exit 5), so the trailing `|| true` here is belt-and-braces for a crash in
+# the shell wrapper, not a cover for gate's own exit code. stdout is
+# deliberately left connected — it is now the channel that matters — while
+# stderr stays redirected to `/dev/null` so noise never reaches the
+# transcript.
+_GATE_HOOK_SPEC = _HookSpec(
+    events=("PreToolUse",),
+    args="gate --hook 2>/dev/null || true",
+    signature="knowledge gate",
+    matcher="Write|Edit|NotebookEdit",
+)
+
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:
     """Register hooks for auto-flushed history and auto-reindexing.
@@ -2706,7 +3067,14 @@ def cmd_install_hooks(args: argparse.Namespace) -> int:
     upgraded: list[str] = []
     commands: list[tuple[tuple[str, ...], str]] = []
 
-    for spec in _HOOK_SPECS:
+    # `getattr` (not `args.with_gate`): older callers/tests build an
+    # argparse.Namespace by hand without this attribute, and its absence
+    # must mean "off", identical to passing --with-gate=False explicitly.
+    specs = _HOOK_SPECS
+    if getattr(args, "with_gate", False):
+        specs = _HOOK_SPECS + (_GATE_HOOK_SPEC,)
+
+    for spec in specs:
         hook_cmd = _resolve_hook_command(absolute=args.absolute, args=spec.args)
         commands.append((spec.events, hook_cmd))
 
@@ -2861,6 +3229,307 @@ def _replace_hook_command(event_list: list, signature: str, new_cmd: str) -> Non
             if isinstance(cmd, str) and _matches_hook_signature(cmd, signature):
                 h["command"] = new_cmd
                 return
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Read-only health report — see ``knowledge/doctor.py`` for the seven
+    checks. Never builds, updates, or writes to the DB/settings/hooks.
+
+    Exit code: 0 when every check is ok or warn, 1 when any check failed.
+    """
+    from . import doctor as doctor_mod
+
+    want_json = getattr(args, "format", "text") == "json"
+    project = getattr(args, "project", None)
+    report = doctor_mod.run(project)
+
+    if want_json:
+        emit(_doctor_payload(report))
+    else:
+        _print_doctor_report(report)
+    return report.exit_code
+
+
+def _doctor_payload(report) -> dict:
+    """Shape a `DoctorReport` for `--format json`."""
+    checks = []
+    for c in report.checks:
+        entry = {"name": c.name, "status": c.status, "detail": c.detail}
+        if c.remedy is not None:
+            entry["remedy"] = c.remedy
+        checks.append(entry)
+    return {"ok": report.ok, "checks": checks, "summary": report.summary}
+
+
+def _print_doctor_report(report) -> None:
+    """Prose rendering: one aligned line per check, remedy on failures,
+    one-line summary at the end."""
+    width = max((len(c.name) for c in report.checks), default=0)
+    for c in report.checks:
+        token = {"ok": "ok  ", "warn": "warn", "fail": "fail"}.get(c.status, c.status)
+        print(f"[{token}] {c.name:<{width}}  {c.detail}")
+        if c.status == "fail" and c.remedy:
+            print(f"         try: {c.remedy}")
+    s = report.summary
+    print(f"\n{s['ok']} ok, {s['warn']} warning(s), {s['fail']} failure(s)")
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """Pre-change conflict sensor — see `knowledge/gate.py` for the four
+    signals combined. Read-only: never writes to the DB or to memory
+    (recording a decision is the user's deliberate act — decision id=185).
+
+    Advisory, not a veto: "conflict" means prior knowledge exists to read,
+    not a refusal to proceed. Exit 5 on conflict, 0 on clear — 5 is
+    reserved specifically for this verb (see docs/exit-codes.md).
+
+    ``--hook`` diverts to `_cmd_gate_hook` before any of the --topic/--files/
+    --format handling below runs — it reads its own target off stdin
+    instead, and --format is irrelevant there (see that function and
+    `--hook`'s own help text for the mutual-exclusion rule: --hook wins).
+    """
+    if getattr(args, "hook", False):
+        return _cmd_gate_hook(args)
+
+    from . import gate as gate_mod
+
+    topic = (args.topic or "").strip() or None
+    # Blank-string entries (e.g. the opt-in PreToolUse hook's `jq` extraction
+    # coming up empty) are treated as "not provided", not as a real target.
+    raw_files = [f.strip() for f in (getattr(args, "files", None) or []) if f and f.strip()]
+
+    if not topic and not raw_files:
+        raise KnowledgeError(
+            "gate_no_target",
+            "gate needs --topic and/or --files — nothing to check prior "
+            "knowledge against.",
+            remedy="knowledge gate --topic '<what you are about to change>'",
+            exit_code=2,
+        )
+
+    with db.connect() as conn:
+        proj = _resolve_project_or_raise(conn, args.project)
+        files = [_resolve_relations_target(f, proj.root_path) for f in raw_files]
+        report = gate_mod.build(conn, proj.id, topic, files)
+
+    if getattr(args, "format", "text") == "json":
+        emit(_gate_payload(report))
+    else:
+        _print_gate_report(report)
+    return report.exit_code
+
+
+def _cmd_gate_hook(args: argparse.Namespace) -> int:
+    """`gate --hook` — PreToolUse entrypoint, invoked by `_GATE_HOOK_SPEC`.
+
+    Claude Code feeds every hook the tool-call event as JSON **on stdin**
+    (not argv) and parses a hook's **stdout** only when the entire output is
+    one JSON object starting with `{` and ending with `}` — plain prose is
+    silently discarded. That is why this mode takes no `--topic`/`--files`:
+    it reads `tool_input.file_path` (falling back to `notebook_path`, then
+    `path`) straight off stdin, needing neither `jq` nor shell quoting, and
+    its only output channel is the `hookSpecificOutput.additionalContext`
+    JSON line built by `_gate_hook_context` below.
+
+    Structurally incapable of blocking: it NEVER emits `permissionDecision`/
+    `decision` (the keys that would let a hook block or auto-approve a tool
+    call even at exit 0), and it ALWAYS returns 0 — a hook must never be the
+    reason a tool call fails. Every failure mode (empty/unparseable stdin, a
+    missing path field, a project-resolution failure, an exception inside
+    `gate.build`) is caught here and degrades to a silent no-op instead of
+    propagating to `main()`'s exit-70/traceback handling.
+    """
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return 0
+
+    try:
+        event = json.loads(raw) if raw.strip() else None
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return 0
+    if not isinstance(event, dict):
+        return 0
+
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
+
+    # Tolerant fallback chain, tried in this exact order: Write/Edit report
+    # `file_path`; NotebookEdit reports `notebook_path`; `path` is a
+    # defensive fallback for any other tool shape. Do not collapse this to
+    # a single key.
+    file_path = None
+    for key in ("file_path", "notebook_path", "path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            file_path = value.strip()
+            break
+    if file_path is None:
+        return 0
+
+    try:
+        from . import gate as gate_mod
+
+        with db.connect() as conn:
+            proj = _resolve_project_or_raise(conn, getattr(args, "project", None))
+            resolved = _resolve_relations_target(file_path, proj.root_path)
+            report = gate_mod.build(conn, proj.id, None, [resolved])
+        if report.verdict == "conflict":
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": _gate_hook_context(report),
+                },
+            }))
+    except Exception:
+        return 0
+    return 0
+
+
+def _gate_hook_context(report) -> str:
+    """Render a conflicting `GateReport` into the compact prose that fills
+    `hookSpecificOutput.additionalContext` — the only output `--hook` mode
+    may ever produce. Reuses `_gate_payload`'s already-shaped decision/
+    history entries (id, date, one-line summary, supersede marker) rather
+    than re-deriving hit formatting a third time.
+    """
+    from datetime import datetime
+
+    payload = _gate_payload(report)
+    lines = ["knowledge gate: prior decisions/history bear on this file —"]
+    for entry in payload["decisions"]:
+        when = datetime.fromtimestamp(entry["created_at"]).strftime("%Y-%m-%d")
+        excerpt = _first_line(entry["decision"], max_chars=100)
+        line = f"- [{entry['topic']}] {excerpt} (id={entry['id']}, {when})"
+        if "superseded_by" in entry:
+            line += f" — SUPERSEDED by id={entry['superseded_by']}"
+        lines.append(line)
+    for entry in payload["history"]:
+        when = datetime.fromtimestamp(entry["created_at"]).strftime("%Y-%m-%d")
+        excerpt = _first_line(entry["short_summary"], max_chars=100)
+        lines.append(f"- history id={entry['id']} ({when}): {excerpt}")
+    return "\n".join(lines)
+
+
+def _gate_payload(report) -> dict:
+    """Shape a `GateReport` for `--format json`.
+
+    Semantic hits and exact-files_touched hits are folded into one
+    "decisions" array (each entry tagged `"match"`) rather than two
+    parallel arrays — a caller filtering on `match` gets the split back
+    without the JSON shape needing a signal-per-key.
+    """
+
+    def _decision_entry(h) -> dict:
+        d = h.decision
+        entry = {
+            "id": d.id,
+            "kind": d.kind,
+            "topic": d.topic,
+            "decision": d.decision,
+            "created_at": d.created_at,
+            "match": "semantic" if h.distance is not None else "files_touched",
+        }
+        if h.distance is not None:
+            entry["distance"] = h.distance
+        if h.superseded_by is not None:
+            entry["superseded_by"] = h.superseded_by
+        return entry
+
+    decisions_out = [_decision_entry(h) for h in (*report.decision_hits, *report.files_touched_hits)]
+    history_out = [
+        {
+            "id": h.entry.id,
+            "short_summary": h.entry.short_summary,
+            "created_at": h.entry.created_at,
+            "distance": h.distance,
+        }
+        for h in report.history_hits
+    ]
+    coupled_out = [
+        {"file": c.rel_path, "direction": c.direction, "kind": c.kind, "via": c.via}
+        for c in report.coupled_files
+    ]
+    return {
+        "ok": True,
+        "verdict": report.verdict,
+        "topic": report.topic,
+        "files": list(report.files),
+        "decisions": decisions_out,
+        "history": history_out,
+        "coupled_files": coupled_out,
+        "summary": {
+            "decisions": len(decisions_out),
+            "history": len(history_out),
+            "superseded_shown": report.superseded_shown,
+        },
+    }
+
+
+def _print_gate_report(report) -> None:
+    """Prose rendering: grouped by signal, terse. Each section is only
+    printed when the input that feeds it was actually given — a bare
+    `--files` call has nothing to say about semantic decisions/history, and
+    printing an empty "not run" section for it would just be noise."""
+    from datetime import datetime
+
+    header = "gate:"
+    if report.topic:
+        header += f"  topic={report.topic!r}"
+    if report.files:
+        header += f"  files={', '.join(report.files)}"
+    print(header)
+
+    def _decision_line(h) -> None:
+        d = h.decision
+        when = datetime.fromtimestamp(d.created_at).strftime("%Y-%m-%d")
+        excerpt = _first_line(d.decision, max_chars=120)
+        marker = "[fact] " if d.kind == "fact" else ""
+        dist_s = f", dist={h.distance:.2f}" if h.distance is not None else ""
+        print(f"  [{marker}{d.topic}] {excerpt}  (id={d.id}, {when}{dist_s})")
+        if h.superseded_by is not None:
+            newer = h.superseded_by
+            print(f"    SUPERSEDED by id={newer}  — read id={newer} instead")
+
+    if report.topic:
+        print("\ndecisions/facts (semantic, near topic):")
+        if report.decision_hits:
+            for h in report.decision_hits:
+                _decision_line(h)
+        else:
+            print("  (none within distance threshold)")
+
+        print("\nhistory (semantic, near topic — prior incidents):")
+        if report.history_hits:
+            for h in report.history_hits:
+                when = datetime.fromtimestamp(h.entry.created_at).strftime("%Y-%m-%d")
+                excerpt = _first_line(h.entry.short_summary, max_chars=120)
+                print(f"  {excerpt}  (id={h.entry.id}, {when}, dist={h.distance:.2f})")
+        else:
+            print("  (none within distance threshold)")
+
+    if report.files:
+        print("\ndecisions/facts (exact files_touched match):")
+        if report.files_touched_hits:
+            for h in report.files_touched_hits:
+                _decision_line(h)
+        else:
+            print("  (none)")
+
+        print("\ncoupled files (direct import graph neighbours):")
+        if report.coupled_files:
+            for c in report.coupled_files:
+                print(f"  {c.direction:<7} {c.rel_path}  ({c.kind}, via {c.via})")
+        else:
+            print("  (none)")
+
+    print(f"\nverdict: {report.verdict}")
+    if report.verdict == "conflict":
+        print(
+            "  prior knowledge exists above — advisory only, not a veto. "
+            "Review it, then proceed or explicitly supersede."
+        )
 
 
 def cmd_history(args: argparse.Namespace) -> int:
@@ -3415,9 +4084,7 @@ def _cmd_vars_set(args: argparse.Namespace) -> int:
         return 1
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         try:
             n = variables.set_many(conn, proj.id, args.scope, pairs)
         except ValueError as exc:
@@ -3462,9 +4129,7 @@ def _cmd_vars_unset(args: argparse.Namespace) -> int:
             return 1
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         try:
             if args.unset_auto:
                 removed = variables.unset_auto_all(conn, proj.id)
@@ -3505,9 +4170,7 @@ def _cmd_vars_list(args: argparse.Namespace) -> int:
     from . import variables
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         rows = variables.list_vars(conn, proj.id, args.scope)
 
     if args.json:
@@ -3549,9 +4212,7 @@ def _cmd_vars_import(args: argparse.Namespace) -> int:
         return 1
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
         try:
             n = variables.import_json(conn, proj.id, args.scope, path)
         except (ValueError, json.JSONDecodeError) as exc:
@@ -3592,9 +4253,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
     from . import graph as graph_mod
 
     with db.connect() as conn:
-        proj = _resolve_project_or_error(conn, args.project)
-        if proj is None:
-            return 1
+        proj = _resolve_project_or_raise(conn, args.project)
 
         html_str = graph_mod.build_graph_html(
             conn,
@@ -3656,25 +4315,47 @@ def _parse_kv_pairs(args_list: list[str]) -> dict[str, str] | None:
     return out
 
 
-def _resolve_project_or_error(conn, selector):
-    """Wrap ``resolve_project`` + uniform error output. Returns the
-    Project on success, or None on any resolution failure (after
-    emitting a message to stderr).
+def _resolve_project_or_raise(conn, selector) -> projects.Project:
+    """Wrap ``resolve_project`` + uniform error handling.
+
+    Returns the resolved ``Project`` on success. Raises ``KnowledgeError``
+    on any resolution failure — either ``selector`` matches no registered
+    project, or (for a non-absolute name selector) matches more than one —
+    so `main()`'s top-level handler renders it as prose-on-stderr or the
+    JSON envelope per the invoked verb's own `--json`/`--format json`
+    request (see `knowledge/jsonout.py`). Callers no longer need an
+    ``if proj is None`` guard: this never returns ``None``.
     """
     try:
         proj = projects.resolve_project(conn, selector)
     except projects.AmbiguousProjectName as exc:
-        _print_ambiguous(exc)
-        return None
+        # No single fixed remedy command exists here — which root to pass
+        # depends on which of `exc.matches` the caller meant — so the
+        # guidance stays folded into the message instead of `remedy`.
+        raise KnowledgeError(
+            "ambiguous_project_name", _ambiguous_project_message(exc)
+        ) from exc
     if proj is None:
         where = selector or str(projects.current_project_root())
-        print(
-            f"error: project not registered: {where}\n"
-            "run 'knowledge build' from the repo root first.",
-            file=sys.stderr,
+        raise KnowledgeError(
+            "project_not_registered",
+            f"project not registered: {where}",
+            remedy="knowledge build",
         )
-        return None
     return proj
+
+
+def _ambiguous_project_message(exc: projects.AmbiguousProjectName) -> str:
+    """Same information content as ``_print_ambiguous``'s multi-line stderr
+    output (candidate roots included), folded into one string so nothing
+    is lost when it travels through the JSON envelope instead.
+    """
+    lines = [
+        f"project name '{exc.name}' is ambiguous ({len(exc.matches)} matches):"
+    ]
+    lines += [f"  - {m.root_path}" for m in exc.matches]
+    lines.append("pass an absolute root path instead of the name to pick one.")
+    return "\n".join(lines)
 
 
 def _print_apply_summary(updated: int, still_parametric: int) -> None:
@@ -3923,6 +4604,8 @@ _DISPATCH = {
     "graph": cmd_graph,
     "install-skill": cmd_install_skill,
     "install-hooks": cmd_install_hooks,
+    "doctor": cmd_doctor,
+    "gate": cmd_gate,
     "skill": lambda args: _SKILL_DISPATCH[args.skill_cmd](args),
     "config": lambda args: _CONFIG_DISPATCH[args.config_cmd](args),
     "db": lambda args: _DB_DISPATCH[args.db_cmd](args),
@@ -4158,79 +4841,52 @@ def cmd_db_ping(args: argparse.Namespace) -> int:
 
 
 def _ping_sqlite() -> int:
-    try:
-        with db.connect() as conn:
-            row = db.fetch_one(conn, "SELECT value FROM meta WHERE key = ?",
-                               ("schema_version",))
-            schema_version = row[0] if row else "unknown"
-            chunks = db.fetch_one(conn, "SELECT COUNT(*) FROM chunks")[0]
-    except Exception as exc:  # noqa: BLE001 — APSW has many failure modes
-        print(f"error opening sqlite DB: {exc}", file=sys.stderr)
+    # Connectivity probe itself lives in doctor.py, shared with `knowledge
+    # doctor`'s "backend" check — this stays a thin formatter over it so
+    # the two verbs can't silently drift apart. Output below is unchanged.
+    from . import doctor as doctor_mod
+
+    probe = doctor_mod._probe_sqlite()
+    if not probe.ok:
+        print(f"error opening sqlite DB: {probe.error}", file=sys.stderr)
         return 2
     print("ok: connected to sqlite")
-    print(f"  path:           {paths.db_path()}")
-    print(f"  schema_version: {schema_version}")
-    print(f"  chunks:         {chunks}")
+    print(f"  path:           {probe.db_path}")
+    print(f"  schema_version: {probe.schema_version}")
+    print(f"  chunks:         {probe.chunk_count}")
     return 0
 
 
 def _ping_postgres(s) -> int:
-    from . import settings as settings_mod
-    from .backends.postgres import PostgresBackend, _DependencyMissing
+    # See _ping_sqlite: the probe itself is shared with `knowledge doctor`.
+    # ping is the triage verb — always re-fetch the pgvector type OIDs and
+    # rewrite the local type cache (refresh_types=True inside the probe),
+    # so a server-side extension recreation (stale cached OIDs) is healed
+    # by the same command a user would naturally reach for.
+    from . import doctor as doctor_mod
 
-    backend = PostgresBackend(s)
-    try:
-        # ping is the triage verb — always re-fetch the pgvector type OIDs
-        # and rewrite the local type cache, so a server-side extension
-        # recreation (stale cached OIDs) is healed by the same command a
-        # user would naturally reach for.
-        conn = backend.connect(refresh_types=True)
-    except _DependencyMissing as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    probe = doctor_mod._probe_postgres(s)
+    if not probe.ok:
+        if probe.error_kind in ("dependency_missing", "dsn"):
+            print(f"error: {probe.error}", file=sys.stderr)
+        else:
+            print(f"error connecting to PostgreSQL: {probe.error}", file=sys.stderr)
         return 2
-    except settings_mod.DsnError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:  # noqa: BLE001 — psycopg has many failure modes
-        print(f"error connecting to PostgreSQL: {exc}", file=sys.stderr)
-        return 2
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT version()")
-            pg_full = cur.fetchone()[0]
-            cur.execute(
-                "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
-            )
-            row = cur.fetchone()
-            pgvector_version = row[0] if row else None
-            cur.execute("SELECT current_database(), current_user")
-            db_name, db_user = cur.fetchone()
-            cur.execute(
-                "SELECT to_regclass('public.projects') IS NOT NULL, "
-                "       to_regclass('public.chunk_embeddings') IS NOT NULL"
-            )
-            schema_ok, embeddings_ok = cur.fetchone()
-            project_count = 0
-            if schema_ok:
-                cur.execute("SELECT COUNT(*) FROM projects")
-                project_count = cur.fetchone()[0]
-    finally:
-        conn.close()
 
     # PostgreSQL 17.0 (Debian 17.0-1.pgdg120+1) on aarch64-... ->
     # extract just the version number for compactness.
+    pg_full = probe.pg_version
     pg_short = pg_full.split(" ", 2)[1] if pg_full.startswith("PostgreSQL ") else pg_full
 
-    print(f"ok: connected to {db_name!r} as {db_user!r}")
+    print(f"ok: connected to {probe.db_name!r} as {probe.db_user!r}")
     print(f"  postgres: {pg_short}")
-    if pgvector_version:
-        print(f"  pgvector: {pgvector_version}")
+    if probe.pgvector_version:
+        print(f"  pgvector: {probe.pgvector_version}")
     else:
         print("  pgvector: NOT INSTALLED")
         print("            run: knowledge db init-postgres")
-    if schema_ok and embeddings_ok:
-        print(f"  schema:   ready ({project_count} project(s) registered)")
+    if probe.schema_ok and probe.embeddings_ok:
+        print(f"  schema:   ready ({probe.project_count} project(s) registered)")
     else:
         print("  schema:   NOT APPLIED")
         print("            run: knowledge db init-postgres")

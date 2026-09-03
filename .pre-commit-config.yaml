@@ -1,0 +1,13 @@
+# Minimal, fast, non-invasive hygiene checks. Deliberately does NOT include
+# a formatter or linter with auto-fix (black / ruff-format / isort) — running
+# one across this codebase for the first time would produce an enormous,
+# unrelated diff. Config only; not run across the repo by this change.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-ast

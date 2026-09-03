@@ -1,0 +1,125 @@
+# Golden-query set for the deterministic retrieval eval harness.
+#
+# Data, not code: each entry maps one query to the results it must recall
+# from the fixture tree at tests/eval/fixtures/billing/. No LLM, no judge
+# model — recall@5 / MRR are computed by exact set/rank comparison against
+# `expect_paths` (chunk/file queries, verb: search) or `expect_topics`
+# (decision/fact queries, verb: decisions_search, matched against seeded
+# rows in `decisions:` below). Floors are measured values (see
+# tests/eval/test_golden_retrieval.py), never invented — a regression that
+# drops real recall below a floor must fail the suite, not just print.
+#
+# rel_path values are relative to fixture_root.
+
+fixture_root: fixtures/billing
+
+# Seeded directly into the decisions store (not indexed from source files)
+# via decisions.add(), using the same fake embedder as the queries below.
+decisions:
+  - topic: "token ttl"
+    decision: "JWT tokens expire after 3600 seconds; do not extend without a security review"
+    kind: decision
+  - topic: "connection pool size"
+    decision: "default database connection pool size is 10; raise only if load testing shows contention"
+    kind: decision
+  - topic: "deploy rollback"
+    decision: "always run rollback_app via the deploy script if a billing deploy fails health checks"
+    kind: fact
+
+queries:
+  - id: py-verify-token
+    verb: search
+    query: "verify a token signature"
+    expect_paths: ["python/auth.py"]
+    min_recall_at_5: 1.0
+    notes: "python function chunk (verify_token)"
+
+  - id: py-auth-manager
+    verb: search
+    query: "manager class that issues tokens and checks whether they have expired using a secret key"
+    expect_paths: ["python/auth.py"]
+    min_recall_at_5: 1.0
+    notes: "python class chunk (AuthManager)"
+
+  - id: py-connect-db
+    verb: search
+    query: "open a database connection"
+    expect_paths: ["python/database.py"]
+    min_recall_at_5: 1.0
+    notes: "python function chunk (connect_db)"
+
+  - id: py-connection-pool
+    verb: search
+    query: "reusable pool of database connections"
+    expect_paths: ["python/database.py"]
+    min_recall_at_5: 1.0
+    notes: "python class chunk (ConnectionPool)"
+
+  - id: js-handle-invoice
+    verb: search
+    query: "handle an invoice lookup request"
+    expect_paths: ["js/api.js"]
+    min_recall_at_5: 1.0
+    notes: "javascript function chunk (handleInvoiceRequest)"
+
+  - id: js-invoice-client
+    verb: search
+    query: "client for fetching invoices from a base url"
+    expect_paths: ["js/api.js"]
+    min_recall_at_5: 1.0
+    notes: "javascript class chunk (InvoiceClient)"
+
+  - id: js-fetch-retry
+    verb: search
+    query: "retry a fetch call up to a limit on failure"
+    expect_paths: ["js/client.js"]
+    min_recall_at_5: 1.0
+    notes: "javascript function chunk (fetchWithRetry)"
+
+  - id: sh-deploy
+    verb: search
+    query: "deploy the billing service with docker"
+    expect_paths: ["scripts/deploy.sh"]
+    min_recall_at_5: 1.0
+    notes: "shell function chunk (deploy_app)"
+
+  - id: sh-rollback
+    verb: search
+    query: "roll back a billing deployment"
+    expect_paths: ["scripts/deploy.sh"]
+    min_recall_at_5: 1.0
+    notes: "shell function chunk (rollback_app)"
+
+  - id: multi-fetch-invoice
+    verb: search
+    query: "retry logic for fetch requests used by invoice lookups"
+    expect_paths: ["js/api.js", "js/client.js"]
+    min_recall_at_5: 1.0
+    notes: "multi-target: both files share fetch/invoice vocabulary"
+
+  - id: dec-token-ttl
+    verb: decisions_search
+    query: "how long do JWT tokens stay valid"
+    expect_topics: ["token ttl"]
+    min_recall_at_5: 1.0
+    notes: "decision retrieval"
+
+  - id: dec-pool-size
+    verb: decisions_search
+    query: "default size of the database connection pool"
+    expect_topics: ["connection pool size"]
+    min_recall_at_5: 1.0
+    notes: "decision retrieval"
+
+  - id: dec-rollback
+    verb: decisions_search
+    query: "what to do when a billing deploy fails health checks"
+    expect_topics: ["deploy rollback"]
+    min_recall_at_5: 1.0
+    notes: "fact retrieval"
+
+# Aggregate floors across all queries above (measured, see test file docstring
+# for the exact run that produced these numbers).
+aggregate:
+  min_mean_recall_at_5: 1.0
+  min_mrr: 1.0

@@ -1,4 +1,4 @@
-.PHONY: guide clean build install-local test-integration sync-skill \
+.PHONY: guide clean build install-local test-integration eval sync-skill \
         pg-build pg-run pg-stop pg-logs pg-psql pg-clean _check-pg-env
 
 PACKAGE_NAME := repo-knowledge
@@ -27,6 +27,16 @@ clean:
 # lightweight build+smoke CI.
 test-integration:
 	bash tests/integration/shared_pg/run.sh
+
+# Deterministic, zero-network golden-query retrieval harness (see
+# tests/eval/): recall@k/MRR floors over a small fixture project, plus the
+# two historical silent-regression guards (project-scope starvation,
+# supersede/authority ranking). Marked `eval` and deselected by the default
+# suite (`-m "not integration"` says nothing about it) — run it explicitly
+# here. `-v` gives a per-test pass/fail line; pytest's own summary line at
+# the end is the pass/fail verdict for the whole suite.
+eval:
+	python -m pytest tests/eval -m eval -v
 
 # Regenerate the per-IDE skill siblings (AGENTS.md, knowledge.mdc) from the
 # canonical skill-template/SKILL.md. Run after editing SKILL.md;

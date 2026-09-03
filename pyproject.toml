@@ -69,4 +69,5 @@ packages = [
 [tool.pytest.ini_options]
 markers = [
     "integration: opt-in end-to-end tests requiring Docker (deselected by default in CI)",
+    "eval: opt-in deterministic golden-query retrieval eval suite (see tests/eval/; deselected by default, run via -m eval / `make eval`)",
 ]

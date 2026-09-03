@@ -47,6 +47,68 @@ from .sanitizer import scrub_text
 from .scanner import walk_project
 from .whitespace import compress
 
+# Cap on how many offending paths a single warning lists — a repo with a
+# broken NFS mount or a directory chmod'd 000 could otherwise flood the
+# terminal with hundreds of lines for what is, functionally, one warning.
+_MAX_LISTED_SKIP_PATHS = 5
+
+
+class _SkipTracker:
+    """Accumulates files that could not be read during a scan.
+
+    ``OSError`` on ``read_bytes()``/``stat()`` (permission denied, a file
+    that vanished or a symlink that broke mid-scan, etc.) previously just
+    ``continue``d past the file with no warning anywhere — the file was
+    silently absent from the index. This collects enough to print one
+    actionable line: how many were skipped, why, and a capped sample of
+    which paths — without holding every path for a pathological repo.
+    """
+
+    def __init__(self) -> None:
+        self.permission_denied = 0
+        self.missing = 0
+        self.other = 0
+        self._sample_paths: list[str] = []
+
+    def record(self, rel_path: str, exc: OSError) -> None:
+        # PermissionError / FileNotFoundError are both OSError subclasses —
+        # distinguishing them is nearly free and tells the user whether to
+        # "fix perms" or shrug off a file that vanished mid-scan.
+        if isinstance(exc, PermissionError):
+            self.permission_denied += 1
+        elif isinstance(exc, FileNotFoundError):
+            self.missing += 1
+        else:
+            self.other += 1
+        if len(self._sample_paths) < _MAX_LISTED_SKIP_PATHS:
+            self._sample_paths.append(rel_path)
+
+    @property
+    def total(self) -> int:
+        return self.permission_denied + self.missing + self.other
+
+    def warning(self) -> str | None:
+        """One-line, print-ready warning, or ``None`` if nothing was skipped."""
+        total = self.total
+        if total == 0:
+            return None
+        reasons = []
+        if self.permission_denied:
+            reasons.append(f"permission denied: {self.permission_denied}")
+        if self.missing:
+            reasons.append(f"missing: {self.missing}")
+        if self.other:
+            reasons.append(f"other: {self.other}")
+        paths = ", ".join(self._sample_paths)
+        remainder = total - len(self._sample_paths)
+        if remainder > 0:
+            paths += f" (and {remainder} more)"
+        plural = "" if total == 1 else "s"
+        return (
+            f"warning: skipped {total} unreadable file{plural} "
+            f"({', '.join(reasons)}): {paths}"
+        )
+
 
 def build_project(
     conn: Connection,
@@ -57,6 +119,7 @@ def build_project(
     """Full rebuild. Returns ``(project_id, file_count, chunk_count)``."""
     project = get_or_create_project(conn, root, name_override)
     backend = db.get_backend()
+    skip_tracker = _SkipTracker()
 
     with db.transaction(conn):
         # On PG: non-blocking advisory lock so two concurrent build/update
@@ -98,7 +161,7 @@ def build_project(
         # COPY (PostgreSQL) vs executemany (SQLite) internally — one path,
         # both backends.
         files_indexed = _build_project_bulk(
-            conn, project.id, root, embed_queue, pending_edges, now
+            conn, project.id, root, embed_queue, pending_edges, now, skip_tracker
         )
 
         # Batch-embed outside the per-file loop to maximize throughput.
@@ -148,6 +211,12 @@ def build_project(
 
     # update_counts queries outside the savepoint above — harmless, auto-commits.
     update_counts(conn, project.id)
+
+    if verbose:
+        warning = skip_tracker.warning()
+        if warning:
+            print(warning, flush=True)
+
     return project.id, files_indexed, len(embed_queue)
 
 
@@ -230,6 +299,7 @@ def update_project(
     files_changed = 0
     files_new = 0
     now = time.time()
+    skip_tracker = _SkipTracker()
 
     # Accumulated during the walk; persisted in one bulk flush after.
     changed_files: list[tuple[int, _ScannedFile]] = []   # (file_id, sf)
@@ -251,7 +321,11 @@ def update_project(
             try:
                 raw_bytes = abs_path.read_bytes()
                 stat = abs_path.stat()
-            except OSError:
+            except OSError as exc:
+                # File is invisible to the index from here on — no chunk,
+                # no embedding — so record it for the summary warning below
+                # rather than silently dropping it.
+                skip_tracker.record(rel, exc)
                 continue
 
             new_hash = hashlib.sha256(raw_bytes).hexdigest()
@@ -443,6 +517,9 @@ def update_project(
     update_counts(conn, project.id)
 
     if verbose:
+        warning = skip_tracker.warning()
+        if warning:
+            print(warning, flush=True)
         print(
             f"update: {files_new} new, {files_changed} changed, "
             f"{files_deleted} deleted; {len(embed_queue)} chunks re-embedded"
@@ -618,12 +695,20 @@ def _scan_bytes(
     )
 
 
-def _scan_file(abs_path: Path, root: Path, lang: str) -> _ScannedFile | None:
+def _scan_file(
+    abs_path: Path,
+    root: Path,
+    lang: str,
+    tracker: _SkipTracker | None = None,
+) -> _ScannedFile | None:
     """Pure per-file scan: read bytes, chunk, big-split, hash, extract edges.
 
     No DB calls — this is the shared core both the SQLite walk and the PG
     bulk builder run, so "how a file becomes rows" lives in exactly one
-    place. Returns None when the file has no chunker or can't be read.
+    place. Returns None when the file has no chunker or can't be read; an
+    unreadable file (``OSError``) is recorded on ``tracker`` (when given) so
+    the caller can warn about it — a missing chunker is not, since that's
+    expected behavior for unsupported languages, not a data-loss surprise.
     """
     chunker = dispatch_chunker(lang)
     if chunker is None:
@@ -631,7 +716,9 @@ def _scan_file(abs_path: Path, root: Path, lang: str) -> _ScannedFile | None:
     try:
         raw_bytes = abs_path.read_bytes()
         stat = abs_path.stat()
-    except OSError:
+    except OSError as exc:
+        if tracker is not None:
+            tracker.record(abs_path.relative_to(root).as_posix(), exc)
         return None
 
     return _scan_bytes(abs_path, root, lang, raw_bytes, stat)
@@ -668,6 +755,7 @@ def _build_project_bulk(
     embed_queue: list[tuple[int, str]],
     pending_edges: list[tuple[int, str, str, list[Edge]]],
     now: float,
+    skip_tracker: _SkipTracker,
 ) -> int:
     """Single build path for both PostgreSQL and SQLite backends.
 
@@ -683,7 +771,7 @@ def _build_project_bulk(
     scanned = [
         sf
         for abs_path, lang in walk_project(root)
-        if (sf := _scan_file(abs_path, root, lang)) is not None
+        if (sf := _scan_file(abs_path, root, lang, skip_tracker)) is not None
     ]
     if not scanned:
         return 0

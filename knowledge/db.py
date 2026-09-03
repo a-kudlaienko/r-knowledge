@@ -536,22 +536,40 @@ def fetch_one(conn, sql: str, params: tuple = ()):
     Translates ``?`` to ``%s`` for PG; SQLite path is unchanged. Wraps the
     psycopg cursor pattern so callers don't need ``with conn.cursor() as cur``
     boilerplate just to read a single row.
+
+    On PostgreSQL, the query is retried once on a transient connection
+    error (see :func:`knowledge.backends.postgres.with_read_retry`) — a
+    ``SELECT`` has no side effects, so retrying is always safe here
+    regardless of whether the surrounding command is itself a read or a
+    write. The SQLite branch below never calls the retry helper at all, so
+    this is structurally a no-op there, not just unlikely to fire.
     """
 
     if current_mode() == "postgresql":
-        with conn.cursor() as cur:
-            cur.execute(sql.replace("?", "%s"), params)
-            return cur.fetchone()
+        from .backends.postgres import with_read_retry
+
+        def _run():
+            with conn.cursor() as cur:
+                cur.execute(sql.replace("?", "%s"), params)
+                return cur.fetchone()
+
+        return with_read_retry(_run, offline_errors())
     return conn.execute(sql, params).fetchone()
 
 
 def fetch_all(conn, sql: str, params: tuple = ()):
-    """Run ``SELECT`` and return all rows. Same dispatch as :func:`fetch_one`."""
+    """Run ``SELECT`` and return all rows. Same dispatch (and retry) as
+    :func:`fetch_one`."""
 
     if current_mode() == "postgresql":
-        with conn.cursor() as cur:
-            cur.execute(sql.replace("?", "%s"), params)
-            return cur.fetchall()
+        from .backends.postgres import with_read_retry
+
+        def _run():
+            with conn.cursor() as cur:
+                cur.execute(sql.replace("?", "%s"), params)
+                return cur.fetchall()
+
+        return with_read_retry(_run, offline_errors())
     return conn.execute(sql, params).fetchall()
 
 

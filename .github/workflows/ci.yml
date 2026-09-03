@@ -5,11 +5,14 @@ name: CI
 #    distribution metadata (catches the MIT license fields, missing
 #    package-data, bad long-description), installs the wheel into a clean
 #    env, and confirms the `knowledge` entry point imports and runs.
-#  * test — pushes to main only (i.e. when a merge lands): runs the pytest
-#    suite. The Docker-backed shared-PG harness (`-m integration`) is
-#    deselected — CI runners have Docker, so without the filter a plain
-#    pytest run would launch the full 15-minute end-to-end scenario; it
-#    stays a local/manual tool (`pytest -m integration`).
+#  * test — every push (main/devel) and every PR: runs the pytest suite,
+#    then the deterministic golden-query eval suite (`-m eval`, tests/eval/;
+#    measured ~0.3-0.5s — negligible, so it runs unconditionally rather than
+#    being confined to a main-only or opt-in job). The Docker-backed
+#    shared-PG harness (`-m integration`) is deselected — CI runners have
+#    Docker, so without the filter a plain pytest run would launch the full
+#    15-minute end-to-end scenario; it stays a local/manual tool
+#    (`pytest -m integration`).
 
 on:
   push:
@@ -61,8 +64,9 @@ jobs:
           path: dist/*
 
   test:
-    # Runs only when a merge (push) lands on main — not on PRs or devel.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Runs on every PR and every push to main/devel (see the `on:` trigger
+    # above) — previously gated to push-to-main only, so pytest never ran on
+    # PRs or on devel pushes; only `build` (which executes no tests) did.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -80,3 +84,12 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest tests/ -m "not integration" -q
+
+      - name: Run golden-query eval suite
+        # Deterministic, zero-network retrieval regression sensor (tests/eval/):
+        # recall@k/MRR floors plus the two historical silent-regression guards
+        # (project-scope starvation, supersede/authority ranking). Excluded
+        # from the run above (`-m "not integration"` does not select `eval`);
+        # measured at ~0.3-0.5s locally, so it runs as its own step on every
+        # PR/push rather than being confined to a main-only or opt-in job.
+        run: python -m pytest tests/eval -m eval -q
